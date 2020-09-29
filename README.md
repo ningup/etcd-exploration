@@ -1,1 +1,1 @@
-# etcd-exploration
+### 本仓库意在进行 etcd 源码学习
