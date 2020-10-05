@@ -28,6 +28,10 @@
 * Stream类型通道：点到点之间维护HTTP长链接，主要用于传输数据量较小的消息，例如追加日志，心跳等；
 * Pipeline类型通道：点到点之间不维护HTTP长链接，短链接传输数据，用完即关闭。用于传输数据量大的消息，例如snapshot数据。
 
+# 3. 体验 etcd 
+## API V2 和 V3
+https://etcd.io/docs/v3.4.0/demo/
+
 ## 主要应用场景
 * 服务发现（Service Discovery）
 * 消息发布与订阅
@@ -36,8 +40,5 @@
 * 分布式锁、分布式队列
 * 集群监控与Leader竞选
 
-# 3. etcd 初体验
-# 4. etcd api v2
-# 5. etcd api v3
-# 6. etcd 运维
-# 7. etcd 安全
+# 4. etcd 运维和安全
+todo
