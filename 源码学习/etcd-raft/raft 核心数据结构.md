@@ -378,8 +378,3 @@ func newLogWithSize(storage Storage, logger Logger, maxNextEntsSize uint64) *raf
 }
 ```
 ![memory storage](../img/4.png)
-
-## raft 实现
-
-# Node 相关结构体
-# raft example
