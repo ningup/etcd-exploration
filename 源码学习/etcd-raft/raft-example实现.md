@@ -1,21 +1,3 @@
-# 1. 说明
-etcd-raft 的特点在于其设计屏蔽了网络、存储等其他模块，只提供接口交由上层应用者来实现，这样的设计思路使其具有很高的可定制性和可测试性。这也决定了想要使用 etcd，用户需要自己补全核心协议之外的部分。raftexample 是 etcd 官方提供的一个示例程序，简单展示了 etcd-raft 的使用方式。
-
-
-# 2. 架构
-![memory storage](../img/5.png)
-
-raft example 主要有 3 个部分组成：
-* kvstore：持久化模块
-* raftnode：核心 raft 组件，对 etcd-raft 的一层封装
-* httpKVAPI：http对外服务
-
-服务之间主要通过 3 个通道来进行交互：
-
-* proposeC：用于处理客户端发来的数据更新请求
-* confChangeC：处理配置变更信息的请求
-* commitC：用于将 raft 产生的 entries 提交到持久化模块中
-
 # 3. 实现
 ## 3.1 入口 main.go
 ```go
