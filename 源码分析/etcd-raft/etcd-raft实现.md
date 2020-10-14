@@ -501,3 +501,153 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	}
 }
 ```
+
+## MsgProc
+客户端的写请求通过 MsgProc 发送给 Leader，响应该消息的方法是 stepLeader()
+```go
+func stepLeader(r *raft, m pb.Message) error {
+	// These message types do not require any progress for m.From.
+	switch m.Type {
+	case pb.MsgProp:
+        // 将上述消息 append 到 raftlog 里
+		if !r.appendEntry(m.Entries...) {
+			return ErrProposalDropped
+		}
+		// 通过 MsgApp 消息向Follower节点复制
+		r.bcastAppend()
+		return nil
+	}
+}
+```
+
+## MsgReadIndex
+（读多写少场景）
+* 客户端的读请求需要读到最新的数据，如果每次读请求都设计磁盘则性能很差
+* Leader 节点保存了最新的数据，只读请求只访问Leader，Leader 节点可以直接返回数据，但是在网络分区的情况下，旧leader还是可能访问到旧数据
+* 因此设计了 MsgReadIndex消息，leader收到请求后，先记录请求编号，然后先确定自己是否是当前的leader（心跳），确定了是leader之后只需要等待leader节点的提交位置等于或者超过只读请求的编号即可返回
+* 响应该消息的方法是 stepLeader()
+```go
+func stepLeader(r *raft, m pb.Message) error {
+	// These message types do not require any progress for m.From.
+	switch m.Type {
+	case pb.MsgReadIndex:
+		// If more than the local vote is needed, go through a full broadcast,
+		// otherwise optimize.
+		// 集群情况
+		if !r.prs.IsSingleton() {
+			if r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) != r.Term {
+				// Reject read only request when this leader has not committed any log entry at its term.
+				return nil
+			}
+
+			// thinking: use an interally defined context instead of the user given context.
+			// We can express this in terms of the term and index instead of a user-supplied value.
+			// This would allow multiple reads to piggyback on the same message.
+			switch r.readOnly.option {
+				// readonlysafe模式
+			case ReadOnlySafe:
+			    // 记录当前已经提交的位置 到 ReadOnly 实例里，下边有说明
+				r.readOnly.addRequest(r.raftLog.committed, m)
+				// The local node automatically acks the request.
+				r.readOnly.recvAck(r.id, m.Entries[0].Data)
+				// 向其他节点发送 MsgHeartBeat 消息（会带上上边生成的只读ID 作为 context字段），然后等待 MsgHeartBeatResp 消息处理,后边说明
+				r.bcastHeartbeatWithCtx(m.Entries[0].Data)
+			case ReadOnlyLeaseBased:
+				ri := r.raftLog.committed
+				if m.From == None || m.From == r.id { // from local member
+					r.readStates = append(r.readStates, ReadState{Index: ri, RequestCtx: m.Entries[0].Data})
+				} else {
+					r.send(pb.Message{To: m.From, Type: pb.MsgReadIndexResp, Index: ri, Entries: m.Entries})
+				}
+			}
+        // 单机情况
+		} else { // only one voting member (the leader) in the cluster
+			if m.From == None || m.From == r.id { // from leader itself
+				r.readStates = append(r.readStates, ReadState{Index: r.raftLog.committed, RequestCtx: m.Entries[0].Data})
+			} else { // from learner member
+				r.send(pb.Message{To: m.From, Type: pb.MsgReadIndexResp, Index: r.raftLog.committed, Entries: m.Entries})
+			}
+		}
+
+		return nil
+	}
+}
+```
+涉及数据结构 ReadOnly
+```go
+type readOnly struct {
+	 // 只读请求模式
+	option           ReadOnlyOption
+	// 收到只读消息后会先创建一个消息 ID（唯一），作为 MsgReadIndex 的第一条 Entry记录
+	// 该字段记录了消息ID对应的的请求 readIndexStatus 
+	pendingReadIndex map[string]*readIndexStatus
+	// 对用的消息ID
+	readIndexQueue   []string
+}
+
+type readIndexStatus struct {
+	// MsgReadIndex 消息
+	req   pb.Message
+	// 请求到达时已提交的位置
+	index uint64
+	// NB: this never records 'false', but it's more convenient to use this
+	// instead of a map[uint64]struct{} due to the API of quorum.VoteResult. If
+	// this becomes performance sensitive enough (doubtful), quorum.VoteResult
+	// can change to an API that is closer to that of CommittedIndex.
+	acks map[uint64]bool
+}
+
+```
+处理 MsgHeartbeatResp 消息
+```go
+case pb.MsgHeartbeatResp:
+		pr.RecentActive = true
+		pr.ProbeSent = false
+
+		// free one slot for the full inflights window to allow progress.
+		if pr.State == tracker.StateReplicate && pr.Inflights.Full() {
+			pr.Inflights.FreeFirstOne()
+		}
+		if pr.Match < r.raftLog.lastIndex() {
+			r.sendAppend(m.From)
+		}
+
+		if r.readOnly.option != ReadOnlySafe || len(m.Context) == 0 {
+			return nil
+		}
+        // 统计携带上述 ID消息的节点个数
+		if r.prs.Voters.VoteResult(r.readOnly.recvAck(m.From, m.Context)) != quorum.VoteWon {
+			return nil
+		}
+
+        // 超过半数之后，会请空 ReadOnly中指定消息 ID及其之前所有相关记录
+		rss := r.readOnly.advance(m)
+		for _, rs := range rss {
+			req := rs.req
+			if req.From == None || req.From == r.id { // from local member
+			    // 如果时客户端直接发到 Leader 节点的消息，则将 MsgReadIndex 消息对应的提交位置、ID 等封装称 ReadState 添加到 raft.readStates 里，后边会有其他协程读取该数组，并对相应的 MsgReadIndex 进行响应 ()
+				r.readStates = append(r.readStates, ReadState{Index: rs.index, RequestCtx: req.Entries[0].Data})
+			} else {
+                // 如果是 follower 转发到 leader 的MsgReadIndex, leader节点回想 follower 返回MsgReadIndexResp消息，并有 follower 响应客户端
+				r.send(pb.Message{To: req.From, Type: pb.MsgReadIndexResp, Index: rs.index, Entries: req.Entries})
+			}
+		}
+```
+
+然后说明一下 Ready.ReadState
+```go
+	// node 进行响应线性读队列，后续单独go协程响应
+	ReadStates []ReadState
+
+```
+```go
+type ReadState struct {
+    // 读请求时的 commit index
+	Index      uint64
+	// 读请求 ID
+	RequestCtx []byte
+}
+```
+* 从以上可以看到客户端的只读请求最终会写入到客户端请求节点的readStates队列中，等待其他goroutine来处理，以上也是MsgReadIndex和MsgReadIndexResp类型消息的处理流程。
+* 上层应用的协程等待状态机应用的的index 打到 读请求时的index后，返回给客户端
+* 这里的linearizableReadLoop相当于是一把锁，控制读请求何时可以从状态机中读取最新数据。
