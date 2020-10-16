@@ -14,10 +14,11 @@
 # 核心数据结构
 由于存在较多的数据结构，这里简述一下其之间的关系, ()里的结构是其接口
 ```go
-//可以管理 watcher 实例的 store
+//可以管理 watcher 实例的 store，这层封装目的是所有的更改在进入 store 存储的过程中会把变更记录，并把记录给watcher对象
 watchableStore
 {
     *store // 内嵌了 store
+    WatchStream()
 }
 
 // mvcc.store 相关，对外提供服务的接口
@@ -51,3 +52,23 @@ backend(Backend)  // 底层存储与上层解耦
 
 }
 ```
+watch 使用方式
+```go
+func testWatch() {
+    s := newWatchableStore()
+    
+    w := s.NewWatchStream()
+    
+    w.Watch(start_key: foo, end_key: nil)
+    
+    w.Watch(start_key: bar, end_key: nil)
+    
+    for {
+        consume := <- w.Chan()
+    }
+}
+```
+* https://wingsxdu.com/post/database/etcd/#%E7%8A%B6%E6%80%81%E6%9C%BA%E5%AD%98%E5%82%A8&gsc.tab=0   mvcc 存储
+* https://segmentfault.com/a/1190000021787011  mvcc 存储
+* https://segmentfault.com/a/1190000021787055 watch
+* https://segmentfault.com/a/1190000021787065 租约 
