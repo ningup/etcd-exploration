@@ -52,22 +52,6 @@ backend(Backend)  // 底层存储与上层解耦
 
 }
 ```
-watch 使用方式
-```go
-func testWatch() {
-    s := newWatchableStore()
-    
-    w := s.NewWatchStream()
-    
-    w.Watch(start_key: foo, end_key: nil)
-    
-    w.Watch(start_key: bar, end_key: nil)
-    
-    for {
-        consume := <- w.Chan()
-    }
-}
-```
 # 3. boltdb 使用简介
 ## 3.1 简述
 * mmap
@@ -509,5 +493,5 @@ type revKeyValue struct {
 ```
 
 # 参考
-* https://wingsxdu.com/post/database/etcd/#%E7%8A%B6%E6%80%81%E6%9C%BA%E5%AD%98%E5%82%A8&gsc.tab=0   mvcc 存储
-* https://segmentfault.com/a/1190000021787011  mvcc 存储
+* https://wingsxdu.com/post/database/etcd/#%E7%8A%B6%E6%80%81%E6%9C%BA%E5%AD%98%E5%82%A8&gsc.tab=0 
+* https://segmentfault.com/a/1190000021787011
