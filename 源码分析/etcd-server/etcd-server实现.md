@@ -408,22 +408,30 @@ type EtcdServer struct {
 	applyV3Base applierV3
 	applyWait   wait.WaitTime
 
+    // 支持watch机制的 v3版本存储
 	kv         mvcc.ConsistentWatchableKV
+	// 租约管理实例
 	lessor     lease.Lessor
 	bemu       sync.Mutex
+	// v3版本后端存储
 	be         backend.Backend
+	// backend 上边封装的一层存储，用于权限控制
 	authStore  auth.AuthStore
+	// backend 上边封装的一层存储，用于记录报警
 	alarmStore *v3alarm.AlarmStore
 
 	stats  *stats.ServerStats
 	lstats *stats.LeaderStats
 
+    // 控制leader定期发送 sync消息的频率
 	SyncTicker *time.Ticker
 	// compactor is used to auto-compact the KV.
+	// 控制 leader 定期要锁存储的频率
 	compactor v3compactor.Compactor
 
 	// peerRt used to send requests (version, lease) to peers.
 	peerRt   http.RoundTripper
+	// 用于生成请求的唯一表示
 	reqIDGen *idutil.Generator
 
 	// forceVersionC is used to force the version monitor loop
@@ -434,6 +442,7 @@ type EtcdServer struct {
 	wgMu sync.RWMutex
 	// wg is used to wait for the go routines that depends on the server state
 	// to exit when stopping the server.
+	// 控制后台协程退出的
 	wg sync.WaitGroup
 
 	// ctx is used for etcd-initiated requests that may need to be canceled
@@ -453,81 +462,63 @@ type EtcdServer struct {
 // NewServer creates a new EtcdServer from the supplied configuration. The
 // configuration is considered static for the lifetime of the EtcdServer.
 func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
+	// 初始化V2存储
 	st := v2store.New(StoreClusterPrefix, StoreKeysPrefix)
 
 	var (
+		// 管理 wal 日志
 		w  *wal.WAL
+		// raft.Node
 		n  raft.Node
+		// memortStorage
 		s  *raft.MemoryStorage
+		// 节点id
 		id types.ID
+		//集群所有成员信息
 		cl *membership.RaftCluster
 	)
 
-	if cfg.MaxRequestBytes > recommendedMaxRequestBytes {
-		if cfg.Logger != nil {
-			cfg.Logger.Warn(
-				"exceeded recommended request limit",
-				zap.Uint("max-request-bytes", cfg.MaxRequestBytes),
-				zap.String("max-request-size", humanize.Bytes(uint64(cfg.MaxRequestBytes))),
-				zap.Int("recommended-request-bytes", recommendedMaxRequestBytes),
-				zap.String("recommended-request-size", humanize.Bytes(uint64(recommendedMaxRequestBytes))),
-			)
-		} else {
-			plog.Warningf("MaxRequestBytes %v exceeds maximum recommended size %v", cfg.MaxRequestBytes, recommendedMaxRequestBytes)
-		}
-	}
-
+    // 创建数据目录
 	if terr := fileutil.TouchDirAll(cfg.DataDir); terr != nil {
 		return nil, fmt.Errorf("cannot access data directory: %v", terr)
 	}
 
+    // 是否有 wal 目录
 	haveWAL := wal.Exist(cfg.WALDir())
 
+    // 确定快照目录是否存在
 	if err = fileutil.TouchDirAll(cfg.SnapDir()); err != nil {
-		if cfg.Logger != nil {
-			cfg.Logger.Fatal(
-				"failed to create snapshot directory",
-				zap.String("path", cfg.SnapDir()),
-				zap.Error(err),
-			)
-		} else {
-			plog.Fatalf("create snapshot directory error: %v", err)
-		}
+		...
 	}
+	//快照管理实例，读写快照
 	ss := snap.New(cfg.Logger, cfg.SnapDir())
 
+    // boltdb 数据库文件 filepath.Join(c.SnapDir(), "db")
 	bepath := cfg.backendPath()
+	// 检测数据库文件是否存在
 	beExist := fileutil.Exist(bepath)
+	// 创建后端存储实例
 	be := openBackend(cfg)
 
-	defer func() {
-		if err != nil {
-			be.Close()
-		}
-	}()
-
+    // 主要负责网络请求等功能
 	prt, err := rafthttp.NewRoundTripper(cfg.PeerTLSInfo, cfg.peerDialTimeout())
-	if err != nil {
-		return nil, err
-	}
 	var (
 		remotes  []*membership.Member
 		snapshot *raftpb.Snapshot
 	)
-
+    // 根据是否存在 wal 目录， 分三种场景
 	switch {
+		// 没有wal目录且当前节点是正在加入一个运行的集群
 	case !haveWAL && !cfg.NewCluster:
+	    // 检查配置是否合法
 		if err = cfg.VerifyJoinExisting(); err != nil {
 			return nil, err
 		}
+		// 根据配置信息，创建 raftCluster 实例和其中的Member实例
 		cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
-		if err != nil {
-			return nil, err
-		}
+		// 从其他节点请求(http,  "root_url/members")获取集群信息并创建相应的 raftCLuster
 		existingCluster, gerr := GetClusterFromRemotePeers(cfg.Logger, getRemotePeerURLs(cl, cfg.Name), prt)
-		if gerr != nil {
-			return nil, fmt.Errorf("cannot fetch cluster info from peer urls: %v", gerr)
-		}
+        // 保证版本兼容
 		if err = membership.ValidateClusterAndAssignIDs(cfg.Logger, cl, existingCluster); err != nil {
 			return nil, fmt.Errorf("error validating peerURLs %s: %v", existingCluster, err)
 		}
@@ -535,49 +526,46 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 			return nil, fmt.Errorf("incompatible with current running cluster")
 		}
 
+        // 更新raftCluster集群id
 		remotes = existingCluster.Members()
 		cl.SetID(types.ID(0), existingCluster.ID())
+		// 设置 V2 存储
 		cl.SetStore(st)
+		// 设置 V3 存储
 		cl.SetBackend(be)
+		// 启动 raftNode, 后边会说明
 		id, n, s, w = startNode(cfg, cl, nil)
 		cl.SetID(id, existingCluster.ID())
 
+	// 没有wal目录且是新建集群
 	case !haveWAL && cfg.NewCluster:
+	    // 检查配置
 		if err = cfg.VerifyBootstrap(); err != nil {
 			return nil, err
 		}
+		// 同理创建 raftCluster 实例
 		cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
-		if err != nil {
-			return nil, err
-		}
+		// 获取当前节点的 Member 实例
 		m := cl.MemberByName(cfg.Name)
+		// 从集群中其他节点获取集群信息，检测是否有重名 
 		if isMemberBootstrapped(cfg.Logger, cl, cfg.Name, prt, cfg.bootstrapTimeout()) {
 			return nil, fmt.Errorf("member %s has already been bootstrapped", m.ID)
 		}
+		// 是否使用 discover 模式
 		if cfg.ShouldDiscover() {
-			var str string
-			str, err = v2discovery.JoinCluster(cfg.Logger, cfg.DiscoveryURL, cfg.DiscoveryProxy, m.ID, cfg.InitialPeerURLsMap.String())
-			if err != nil {
-				return nil, &DiscoveryError{Op: "join", Err: err}
-			}
-			var urlsmap types.URLsMap
-			urlsmap, err = types.NewURLsMap(str)
-			if err != nil {
-				return nil, err
-			}
-			if checkDuplicateURL(urlsmap) {
-				return nil, fmt.Errorf("discovery cluster %s has duplicate url", urlsmap)
-			}
-			if cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, urlsmap); err != nil {
-				return nil, err
-			}
+			...
 		}
 		cl.SetStore(st)
 		cl.SetBackend(be)
+		// 启动节点
 		id, n, s, w = startNode(cfg, cl, cl.MemberIDs())
 		cl.SetID(id, cl.ID())
 
+	// 有 wal 目录
+	// 主要是通过快照恢复 V2v3存储，然后恢复 raft.Node 实例
+	// V2存储就是加载json，v3存储恢复是用可用的 boltdb数据库文件
 	case haveWAL:
+	    // 检测目录可写
 		if err = fileutil.IsDirWriteable(cfg.MemberDir()); err != nil {
 			return nil, fmt.Errorf("cannot write to member directory: %v", err)
 		}
@@ -586,67 +574,30 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 			return nil, fmt.Errorf("cannot write to WAL directory: %v", err)
 		}
 
-		if cfg.ShouldDiscover() {
-			if cfg.Logger != nil {
-				cfg.Logger.Warn(
-					"discovery token is ignored since cluster already initialized; valid logs are found",
-					zap.String("wal-dir", cfg.WALDir()),
-				)
-			} else {
-				plog.Warningf("discovery token ignored since a cluster has already been initialized. Valid log found at %q", cfg.WALDir())
-			}
-		}
-
 		// Find a snapshot to start/restart a raft node
+		// 查找合法的快照
 		walSnaps, serr := wal.ValidSnapshotEntries(cfg.Logger, cfg.WALDir())
 		if serr != nil {
 			return nil, serr
 		}
 		// snapshot files can be orphaned if etcd crashes after writing them but before writing the corresponding
 		// wal log entries
+		// 加载wal快照
 		snapshot, err = ss.LoadNewestAvailable(walSnaps)
 		if err != nil && err != snap.ErrNoSnapshot {
 			return nil, err
 		}
 
+        // 如果快照不为空
 		if snapshot != nil {
+			// 恢复成V2类型存储
 			if err = st.Recovery(snapshot.Data); err != nil {
-				if cfg.Logger != nil {
-					cfg.Logger.Panic("failed to recover from snapshot")
-				} else {
-					plog.Panicf("recovered store from snapshot error: %v", err)
-				}
 			}
-
-			if cfg.Logger != nil {
-				cfg.Logger.Info(
-					"recovered v2 store from snapshot",
-					zap.Uint64("snapshot-index", snapshot.Metadata.Index),
-					zap.String("snapshot-size", humanize.Bytes(uint64(snapshot.Size()))),
-				)
-			} else {
-				plog.Infof("recovered store from snapshot at index %d", snapshot.Metadata.Index)
-			}
-
+			// 恢复成V23型存储
 			if be, err = recoverSnapshotBackend(cfg, be, *snapshot); err != nil {
-				if cfg.Logger != nil {
-					cfg.Logger.Panic("failed to recover v3 backend from snapshot", zap.Error(err))
-				} else {
-					plog.Panicf("recovering backend from snapshot error: %v", err)
-				}
-			}
-			if cfg.Logger != nil {
-				s1, s2 := be.Size(), be.SizeInUse()
-				cfg.Logger.Info(
-					"recovered v3 backend from snapshot",
-					zap.Int64("backend-size-bytes", s1),
-					zap.String("backend-size", humanize.Bytes(uint64(s1))),
-					zap.Int64("backend-size-in-use-bytes", s2),
-					zap.String("backend-size-in-use", humanize.Bytes(uint64(s2))),
-				)
 			}
 		}
-
+        // 重启 raftNode
 		if !cfg.ForceNewCluster {
 			id, cl, n, s, w = restartNode(cfg, snapshot)
 		} else {
@@ -655,12 +606,14 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 
 		cl.SetStore(st)
 		cl.SetBackend(be)
+		//  从v2存储回复集群信息会检测 wal日志和快照数据版本兼容性
 		cl.Recover(api.UpdateCapability)
 		if cl.Version() != nil && !cl.Version().LessThan(semver.Version{Major: 3}) && !beExist {
 			os.RemoveAll(bepath)
 			return nil, fmt.Errorf("database file (%v) of the backend is missing", bepath)
 		}
 
+    // 不支持其他场景
 	default:
 		return nil, fmt.Errorf("unsupported bootstrap config")
 	}
@@ -673,6 +626,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	lstats := stats.NewLeaderStats(id.String())
 
 	heartbeat := time.Duration(cfg.TickMs) * time.Millisecond
+	//  创建 etcdServer 实例
 	srv = &EtcdServer{
 		readych:     make(chan struct{}),
 		Cfg:         cfg,
@@ -786,6 +740,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	}
 
 	// TODO: move transport initialization near the definition of remote
+	// 启动 rafthttpTransport 实例
 	tr := &rafthttp.Transport{
 		Logger:      cfg.Logger,
 		TLSInfo:     cfg.PeerTLSInfo,
@@ -816,5 +771,291 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	srv.r.transport = tr
 
 	return srv, nil
+}
+```
+startNode()
+```go
+func startNode(cfg ServerConfig, cl *membership.RaftCluster, ids []types.ID) (id types.ID, n raft.Node, s *raft.MemoryStorage, w *wal.WAL) {
+	var err error
+	member := cl.MemberByName(cfg.Name)
+	// 节点信息序列化
+	metadata := pbutil.MustMarshal(
+		&pb.Metadata{
+			NodeID:    uint64(member.ID),
+			ClusterID: uint64(cl.ID()),
+		},
+	)
+	// 创建 wal日志文件，将上边的元数据信息写入第一条
+	if w, err = wal.Create(cfg.Logger, cfg.WALDir(), metadata); err != nil {
+	}
+	if cfg.UnsafeNoFsync {
+		w.SetUnsafeNoFsync()
+	}
+	// 每个节点创建 peer 实例
+	peers := make([]raft.Peer, len(ids))
+    // 新建 MemortStorage 实例
+	s = raft.NewMemoryStorage()
+	// 初始化raft 的配置实例
+	c := &raft.Config{
+		ID:              uint64(id),
+		ElectionTick:    cfg.ElectionTicks,
+		HeartbeatTick:   1,
+		Storage:         s,
+		MaxSizePerMsg:   maxSizePerMsg,
+		MaxInflightMsgs: maxInflightMsgs,
+		CheckQuorum:     true,
+		PreVote:         cfg.PreVote,
+	}
+	// 启动 raft Node
+	if len(peers) == 0 {
+		n = raft.RestartNode(c)
+	} else {
+		n = raft.StartNode(c, peers)
+	}
+	raftStatusMu.Lock()
+	raftStatus = n.Status
+	raftStatusMu.Unlock()
+	return id, n, s, w
+```
+
+restartNode()
+```go
+func restartNode(cfg ServerConfig, snapshot *raftpb.Snapshot) (types.ID, *membership.RaftCluster, raft.Node, *raft.MemoryStorage, *wal.WAL) {
+	var walsnap walpb.Snapshot
+	if snapshot != nil {
+		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
+	}
+	// 根据快照的元数据查找合适的 wal 日志并进行 wal日志的回收
+	w, id, cid, st, ents := readWAL(cfg.Logger, cfg.WALDir(), walsnap, cfg.UnsafeNoFsync)
+
+	cl := membership.NewCluster(cfg.Logger, "")
+	cl.SetID(id, cid)
+	// 创建Memorit实例
+	s := raft.NewMemoryStorage()
+	if snapshot != nil {
+		// 快照数据记录到 Memortstorage 实例
+		s.ApplySnapshot(*snapshot)
+	}
+	s.SetHardState(st)
+	// 追加entry记录
+	s.Append(ents)
+	// 创建 raft 配置实例
+	c := &raft.Config{
+		ID:              uint64(id),
+		ElectionTick:    cfg.ElectionTicks,
+		HeartbeatTick:   1,
+		Storage:         s,
+		MaxSizePerMsg:   maxSizePerMsg,
+		MaxInflightMsgs: maxInflightMsgs,
+		CheckQuorum:     true,
+		PreVote:         cfg.PreVote,
+	}
+	// 调用 raft 重启
+	n := raft.RestartNode(c)
+	raftStatusMu.Lock()
+	raftStatus = n.Status
+	raftStatusMu.Unlock()
+	return id, cl, n, s, w
+}
+```
+## 注册 handler
+etcdserver.Newserver之后，transport实例已经启动，可以在上边注册handler，用于集群内部个节点通信
+```go
+func newPeerHandler(
+	lg *zap.Logger,
+	s etcdserver.Server,
+	raftHandler http.Handler,
+	leaseHandler http.Handler,
+	hashKVHandler http.Handler,
+) http.Handler {
+	// 请求集群信息的handler
+	peerMembersHandler := newPeerMembersHandler(lg, s.Cluster())
+	peerMemberPromoteHandler := newPeerMemberPromoteHandler(lg, s)
+
+	mux := http.NewServeMux()
+	// 默认handler 404
+	mux.HandleFunc("/", http.NotFound)
+	mux.Handle(rafthttp.RaftPrefix, raftHandler)
+	mux.Handle(rafthttp.RaftPrefix+"/", raftHandler)
+	mux.Handle(peerMembersPath, peerMembersHandler)
+	mux.Handle(peerMemberPromotePrefix, peerMemberPromoteHandler)
+	if leaseHandler != nil {
+		mux.Handle(leasehttp.LeasePrefix, leaseHandler)
+		mux.Handle(leasehttp.LeaseInternalPrefix, leaseHandler)
+	}
+	if hashKVHandler != nil {
+		mux.Handle(etcdserver.PeerHashKVPath, hashKVHandler)
+	}
+	mux.HandleFunc(versionPath, versionHandler(s.Cluster(), serveVersion))
+	return mux
+}
+```
+## 启动 EtcdServer.Start()
+```go
+func (s *EtcdServer) Start() {
+	// 启动一个协程，执行 EtcdServer.run()
+	s.start()
+	s.goAttach(func() { s.adjustTicks() })
+	// 启动一个后台协程，将当前节点相关信息发送到其他节点（http put）
+	s.goAttach(func() { s.publish(s.Cfg.ReqTimeout()) })
+	// 清理 wal 日志和快照文件
+	s.goAttach(s.purgeFile)
+	// 监控相关
+	s.goAttach(func() { monitorFileDescriptor(s.getLogger(), s.stopping) })
+	// 监控其他节点版本信息，主要是升级场景
+	s.goAttach(s.monitorVersions)
+	// 线性读
+	s.goAttach(s.linearizableReadLoop)
+	// 监控 kv hash 相关
+	s.goAttach(s.monitorKVHash)
+}
+```
+
+### start
+完成 etcdServer 剩余初始化字段，然后执行 run（启动核心）
+```go
+func (s *EtcdServer) start() {
+	...
+	go s.run()
+}
+```
+run
+```go
+func (s *EtcdServer) run() {
+	lg := s.getLogger()
+	sn, err := s.r.raftStorage.Snapshot()
+	// asynchronously accept apply packets, dispatch progress in-order
+	// 启动 fifo 调用器
+	sched := schedule.NewFIFOScheduler()
+
+	var (
+		smu   sync.RWMutex
+		syncC <-chan time.Time
+	)
+	// 用来设置 sync 消息定时器
+	setSyncC := func(ch <-chan time.Time) {
+		smu.Lock()
+		syncC = ch
+		smu.Unlock()
+	}
+	getSyncC := func() (ch <-chan time.Time) {
+		smu.RLock()
+		ch = syncC
+		smu.RUnlock()
+		return
+	}
+	// 实例化 raftReadyHandler
+	rh := &raftReadyHandler{
+		getLead:    func() (lead uint64) { return s.getLead() },
+		updateLead: func(lead uint64) { s.setLead(lead) },
+		// leader 发生变化的一些操作
+		updateLeadership: func(newLeader bool) {
+			if !s.isLeader() {
+				if s.lessor != nil {  // leasor 降级
+					s.lessor.Demote()
+				}
+				if s.compactor != nil {
+					s.compactor.Pause()
+				}
+				setSyncC(nil)  // 非leader 节点不发送 sync 消息
+			} else {
+				if newLeader {
+					t := time.Now()
+					s.leadTimeMu.Lock()
+					s.leadElectedTime = t
+					s.leadTimeMu.Unlock()
+				}
+				// leader 定期发送 sync 消息
+				setSyncC(s.SyncTicker.C)
+				if s.compactor != nil {
+					s.compactor.Resume()
+				}
+			}
+			if newLeader {
+				s.leaderChangedMu.Lock()
+				lc := s.leaderChanged
+				s.leaderChanged = make(chan struct{})
+				close(lc)
+				s.leaderChangedMu.Unlock()
+			}
+			// TODO: remove the nil checking
+			// current test utility does not provide the stats
+			if s.stats != nil {
+				s.stats.BecomeLeader()
+			}
+		},
+		// 更新 Server 的 committedIndex
+		updateCommittedIndex: func(ci uint64) {
+			cci := s.getCommittedIndex()
+			if ci > cci {
+				s.setCommittedIndex(ci)
+			}
+		},
+	}
+	// 启动raft，会启动协程处理 Ready 实例
+	s.r.start(rh)
+
+	ep := etcdProgress{
+		confState: sn.Metadata.ConfState,
+		snapi:     sn.Metadata.Index,
+		appliedt:  sn.Metadata.Term,
+		appliedi:  sn.Metadata.Index,
+	}
+
+	defer func() {
+      ...
+	}()
+
+	var expiredLeaseC <-chan []*lease.Lease
+	if s.lessor != nil {
+		expiredLeaseC = s.lessor.ExpiredLeasesC()
+	}
+
+	for {
+		select {
+		case ap := <-s.r.apply():  // 读取 raftNode 的applyC通道 并进行处理, 后边介绍 applyAll()
+			f := func(context.Context) { s.applyAll(&ep, &ap) }
+			// fifo 调度
+			sched.Schedule(f)
+			// 有过期的租约，后边说明
+		case leases := <-expiredLeaseC:
+			
+		// 定时发送 sync 消息
+		case <-getSyncC():
+			if s.v2store.HasTTLKeys() {
+				s.sync(s.Cfg.ReqTimeout())
+			}
+		case <-s.stop:
+			return
+		}
+	}
+}
+```
+
+### 处理 APPly
+```go
+func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
+	// 处理快照数据
+	s.applySnapshot(ep, apply)
+	// 处理添加日志
+	s.applyEntries(ep, apply)
+
+	proposalsApplied.Set(float64(ep.appliedi))
+	s.applyWait.Trigger(ep.appliedi)
+
+    //  根据上边处理的结果检测是否需要生成新的快照，最后处理 MSGSNAP消息
+	// wait for the raft routine to finish the disk writes before triggering a
+	// snapshot. or applied index might be greater than the last index in raft
+	// storage, since the raft routine might be slower than apply routine.
+	<-apply.notifyc
+
+	s.triggerSnapshot(ep)
+	select {
+	// snapshot requested via send()
+	case m := <-s.r.msgSnapC:
+		merged := s.createMergedSnapshotMessage(m, ep.appliedt, ep.appliedi, ep.confState)
+		s.sendMergedSnap(merged)
+	default:
+	}
 }
 ```
