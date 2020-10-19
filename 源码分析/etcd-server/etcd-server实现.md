@@ -335,3 +335,486 @@ func (c *RaftCluster) AddMember(m *Member) {
 	}
 }
 ```
+
+# 3. EtcdServer
+```go
+// EtcdServer is the production implementation of the Server interface
+// 核心字段
+type EtcdServer struct {
+	// inflightSnapshots holds count the number of snapshots currently inflight.
+	// 发送出去但是未响应的快照数据
+	inflightSnapshots int64  // must use atomic operations to access; keep 64-bit aligned.
+	// 节点应用的最大索引
+	appliedIndex      uint64 // must use atomic operations to access; keep 64-bit aligned.
+	// 节点提交的最大索引
+	committedIndex    uint64 // must use atomic operations to access; keep 64-bit aligned.
+	term              uint64 // must use atomic operations to access; keep 64-bit aligned.
+	lead              uint64 // must use atomic operations to access; keep 64-bit aligned.
+
+	// consistIndex used to hold the offset of current executing entry
+	// It is initialized to 0 before executing any entry.
+	consistIndex consistentIndex // must use atomic operations to access; keep 64-bit aligned.
+	// etcdserver.raftNode
+	r            raftNode        // uses 64-bit atomics; keep 64-bit aligned.
+
+    // 节点自身的信息推送给其他节点后，会关闭通道，相当于是对外服务的一个信号
+	readych chan struct{}
+	Cfg     ServerConfig
+
+	lgMu *sync.RWMutex
+	lg   *zap.Logger
+
+    // 负责协调多个协程之间的执行
+	w wait.Wait
+
+	readMu sync.RWMutex
+	// read routine notifies etcd server that it waits for reading by sending an empty struct to
+	// readwaitC
+	// 用来协调线性读相关的协程
+	readwaitc chan struct{}
+	// readNotifier is used to notify the read routine that it can process the request
+	// when there is no error
+	readNotifier *notifier
+
+	// stop signals the run goroutine should shutdown.
+	stop chan struct{}
+	// stopping is closed by run goroutine on shutdown.
+	stopping chan struct{}
+	// done is closed when all goroutines from start() complete.
+	done chan struct{}
+	// leaderChanged is used to notify the linearizable read loop to drop the old read requests.
+	leaderChanged   chan struct{}
+	leaderChangedMu sync.RWMutex
+
+	errorc     chan error
+	id         types.ID
+	attributes membership.Attributes
+
+    // 记录集群全部节点信息
+	cluster *membership.RaftCluster
+
+    // v2 版本存储
+	v2store     v2store.Store
+	// 用来读写快照文件
+	snapshotter *snap.Snapshotter
+
+    // 应用v2版本的 entry
+	applyV2 ApplierV2
+
+	// applyV3 is the applier with auth and quotas
+    // 应用v3版本的 entry
+	applyV3 applierV3
+	// applyV3Base is the core applier without auth or quotas
+	applyV3Base applierV3
+	applyWait   wait.WaitTime
+
+	kv         mvcc.ConsistentWatchableKV
+	lessor     lease.Lessor
+	bemu       sync.Mutex
+	be         backend.Backend
+	authStore  auth.AuthStore
+	alarmStore *v3alarm.AlarmStore
+
+	stats  *stats.ServerStats
+	lstats *stats.LeaderStats
+
+	SyncTicker *time.Ticker
+	// compactor is used to auto-compact the KV.
+	compactor v3compactor.Compactor
+
+	// peerRt used to send requests (version, lease) to peers.
+	peerRt   http.RoundTripper
+	reqIDGen *idutil.Generator
+
+	// forceVersionC is used to force the version monitor loop
+	// to detect the cluster version immediately.
+	forceVersionC chan struct{}
+
+	// wgMu blocks concurrent waitgroup mutation while server stopping
+	wgMu sync.RWMutex
+	// wg is used to wait for the go routines that depends on the server state
+	// to exit when stopping the server.
+	wg sync.WaitGroup
+
+	// ctx is used for etcd-initiated requests that may need to be canceled
+	// on etcd server shutdown.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	leadTimeMu      sync.RWMutex
+	leadElectedTime time.Time
+
+	*AccessController
+}
+```
+
+## 初始化 server
+```go
+// NewServer creates a new EtcdServer from the supplied configuration. The
+// configuration is considered static for the lifetime of the EtcdServer.
+func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
+	st := v2store.New(StoreClusterPrefix, StoreKeysPrefix)
+
+	var (
+		w  *wal.WAL
+		n  raft.Node
+		s  *raft.MemoryStorage
+		id types.ID
+		cl *membership.RaftCluster
+	)
+
+	if cfg.MaxRequestBytes > recommendedMaxRequestBytes {
+		if cfg.Logger != nil {
+			cfg.Logger.Warn(
+				"exceeded recommended request limit",
+				zap.Uint("max-request-bytes", cfg.MaxRequestBytes),
+				zap.String("max-request-size", humanize.Bytes(uint64(cfg.MaxRequestBytes))),
+				zap.Int("recommended-request-bytes", recommendedMaxRequestBytes),
+				zap.String("recommended-request-size", humanize.Bytes(uint64(recommendedMaxRequestBytes))),
+			)
+		} else {
+			plog.Warningf("MaxRequestBytes %v exceeds maximum recommended size %v", cfg.MaxRequestBytes, recommendedMaxRequestBytes)
+		}
+	}
+
+	if terr := fileutil.TouchDirAll(cfg.DataDir); terr != nil {
+		return nil, fmt.Errorf("cannot access data directory: %v", terr)
+	}
+
+	haveWAL := wal.Exist(cfg.WALDir())
+
+	if err = fileutil.TouchDirAll(cfg.SnapDir()); err != nil {
+		if cfg.Logger != nil {
+			cfg.Logger.Fatal(
+				"failed to create snapshot directory",
+				zap.String("path", cfg.SnapDir()),
+				zap.Error(err),
+			)
+		} else {
+			plog.Fatalf("create snapshot directory error: %v", err)
+		}
+	}
+	ss := snap.New(cfg.Logger, cfg.SnapDir())
+
+	bepath := cfg.backendPath()
+	beExist := fileutil.Exist(bepath)
+	be := openBackend(cfg)
+
+	defer func() {
+		if err != nil {
+			be.Close()
+		}
+	}()
+
+	prt, err := rafthttp.NewRoundTripper(cfg.PeerTLSInfo, cfg.peerDialTimeout())
+	if err != nil {
+		return nil, err
+	}
+	var (
+		remotes  []*membership.Member
+		snapshot *raftpb.Snapshot
+	)
+
+	switch {
+	case !haveWAL && !cfg.NewCluster:
+		if err = cfg.VerifyJoinExisting(); err != nil {
+			return nil, err
+		}
+		cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
+		if err != nil {
+			return nil, err
+		}
+		existingCluster, gerr := GetClusterFromRemotePeers(cfg.Logger, getRemotePeerURLs(cl, cfg.Name), prt)
+		if gerr != nil {
+			return nil, fmt.Errorf("cannot fetch cluster info from peer urls: %v", gerr)
+		}
+		if err = membership.ValidateClusterAndAssignIDs(cfg.Logger, cl, existingCluster); err != nil {
+			return nil, fmt.Errorf("error validating peerURLs %s: %v", existingCluster, err)
+		}
+		if !isCompatibleWithCluster(cfg.Logger, cl, cl.MemberByName(cfg.Name).ID, prt) {
+			return nil, fmt.Errorf("incompatible with current running cluster")
+		}
+
+		remotes = existingCluster.Members()
+		cl.SetID(types.ID(0), existingCluster.ID())
+		cl.SetStore(st)
+		cl.SetBackend(be)
+		id, n, s, w = startNode(cfg, cl, nil)
+		cl.SetID(id, existingCluster.ID())
+
+	case !haveWAL && cfg.NewCluster:
+		if err = cfg.VerifyBootstrap(); err != nil {
+			return nil, err
+		}
+		cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)
+		if err != nil {
+			return nil, err
+		}
+		m := cl.MemberByName(cfg.Name)
+		if isMemberBootstrapped(cfg.Logger, cl, cfg.Name, prt, cfg.bootstrapTimeout()) {
+			return nil, fmt.Errorf("member %s has already been bootstrapped", m.ID)
+		}
+		if cfg.ShouldDiscover() {
+			var str string
+			str, err = v2discovery.JoinCluster(cfg.Logger, cfg.DiscoveryURL, cfg.DiscoveryProxy, m.ID, cfg.InitialPeerURLsMap.String())
+			if err != nil {
+				return nil, &DiscoveryError{Op: "join", Err: err}
+			}
+			var urlsmap types.URLsMap
+			urlsmap, err = types.NewURLsMap(str)
+			if err != nil {
+				return nil, err
+			}
+			if checkDuplicateURL(urlsmap) {
+				return nil, fmt.Errorf("discovery cluster %s has duplicate url", urlsmap)
+			}
+			if cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, urlsmap); err != nil {
+				return nil, err
+			}
+		}
+		cl.SetStore(st)
+		cl.SetBackend(be)
+		id, n, s, w = startNode(cfg, cl, cl.MemberIDs())
+		cl.SetID(id, cl.ID())
+
+	case haveWAL:
+		if err = fileutil.IsDirWriteable(cfg.MemberDir()); err != nil {
+			return nil, fmt.Errorf("cannot write to member directory: %v", err)
+		}
+
+		if err = fileutil.IsDirWriteable(cfg.WALDir()); err != nil {
+			return nil, fmt.Errorf("cannot write to WAL directory: %v", err)
+		}
+
+		if cfg.ShouldDiscover() {
+			if cfg.Logger != nil {
+				cfg.Logger.Warn(
+					"discovery token is ignored since cluster already initialized; valid logs are found",
+					zap.String("wal-dir", cfg.WALDir()),
+				)
+			} else {
+				plog.Warningf("discovery token ignored since a cluster has already been initialized. Valid log found at %q", cfg.WALDir())
+			}
+		}
+
+		// Find a snapshot to start/restart a raft node
+		walSnaps, serr := wal.ValidSnapshotEntries(cfg.Logger, cfg.WALDir())
+		if serr != nil {
+			return nil, serr
+		}
+		// snapshot files can be orphaned if etcd crashes after writing them but before writing the corresponding
+		// wal log entries
+		snapshot, err = ss.LoadNewestAvailable(walSnaps)
+		if err != nil && err != snap.ErrNoSnapshot {
+			return nil, err
+		}
+
+		if snapshot != nil {
+			if err = st.Recovery(snapshot.Data); err != nil {
+				if cfg.Logger != nil {
+					cfg.Logger.Panic("failed to recover from snapshot")
+				} else {
+					plog.Panicf("recovered store from snapshot error: %v", err)
+				}
+			}
+
+			if cfg.Logger != nil {
+				cfg.Logger.Info(
+					"recovered v2 store from snapshot",
+					zap.Uint64("snapshot-index", snapshot.Metadata.Index),
+					zap.String("snapshot-size", humanize.Bytes(uint64(snapshot.Size()))),
+				)
+			} else {
+				plog.Infof("recovered store from snapshot at index %d", snapshot.Metadata.Index)
+			}
+
+			if be, err = recoverSnapshotBackend(cfg, be, *snapshot); err != nil {
+				if cfg.Logger != nil {
+					cfg.Logger.Panic("failed to recover v3 backend from snapshot", zap.Error(err))
+				} else {
+					plog.Panicf("recovering backend from snapshot error: %v", err)
+				}
+			}
+			if cfg.Logger != nil {
+				s1, s2 := be.Size(), be.SizeInUse()
+				cfg.Logger.Info(
+					"recovered v3 backend from snapshot",
+					zap.Int64("backend-size-bytes", s1),
+					zap.String("backend-size", humanize.Bytes(uint64(s1))),
+					zap.Int64("backend-size-in-use-bytes", s2),
+					zap.String("backend-size-in-use", humanize.Bytes(uint64(s2))),
+				)
+			}
+		}
+
+		if !cfg.ForceNewCluster {
+			id, cl, n, s, w = restartNode(cfg, snapshot)
+		} else {
+			id, cl, n, s, w = restartAsStandaloneNode(cfg, snapshot)
+		}
+
+		cl.SetStore(st)
+		cl.SetBackend(be)
+		cl.Recover(api.UpdateCapability)
+		if cl.Version() != nil && !cl.Version().LessThan(semver.Version{Major: 3}) && !beExist {
+			os.RemoveAll(bepath)
+			return nil, fmt.Errorf("database file (%v) of the backend is missing", bepath)
+		}
+
+	default:
+		return nil, fmt.Errorf("unsupported bootstrap config")
+	}
+
+	if terr := fileutil.TouchDirAll(cfg.MemberDir()); terr != nil {
+		return nil, fmt.Errorf("cannot access member directory: %v", terr)
+	}
+
+	sstats := stats.NewServerStats(cfg.Name, id.String())
+	lstats := stats.NewLeaderStats(id.String())
+
+	heartbeat := time.Duration(cfg.TickMs) * time.Millisecond
+	srv = &EtcdServer{
+		readych:     make(chan struct{}),
+		Cfg:         cfg,
+		lgMu:        new(sync.RWMutex),
+		lg:          cfg.Logger,
+		errorc:      make(chan error, 1),
+		v2store:     st,
+		snapshotter: ss,
+		r: *newRaftNode(
+			raftNodeConfig{
+				lg:          cfg.Logger,
+				isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
+				Node:        n,
+				heartbeat:   heartbeat,
+				raftStorage: s,
+				storage:     NewStorage(w, ss),
+			},
+		),
+		id:               id,
+		attributes:       membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
+		cluster:          cl,
+		stats:            sstats,
+		lstats:           lstats,
+		SyncTicker:       time.NewTicker(500 * time.Millisecond),
+		peerRt:           prt,
+		reqIDGen:         idutil.NewGenerator(uint16(id), time.Now()),
+		forceVersionC:    make(chan struct{}),
+		AccessController: &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
+	}
+	serverID.With(prometheus.Labels{"server_id": id.String()}).Set(1)
+
+	srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
+
+	srv.be = be
+	minTTL := time.Duration((3*cfg.ElectionTicks)/2) * heartbeat
+
+	// always recover lessor before kv. When we recover the mvcc.KV it will reattach keys to its leases.
+	// If we recover mvcc.KV first, it will attach the keys to the wrong lessor before it recovers.
+	srv.lessor = lease.NewLessor(
+		srv.getLogger(),
+		srv.be,
+		lease.LessorConfig{
+			MinLeaseTTL:                int64(math.Ceil(minTTL.Seconds())),
+			CheckpointInterval:         cfg.LeaseCheckpointInterval,
+			ExpiredLeasesRetryInterval: srv.Cfg.ReqTimeout(),
+		})
+
+	tp, err := auth.NewTokenProvider(cfg.Logger, cfg.AuthToken,
+		func(index uint64) <-chan struct{} {
+			return srv.applyWait.Wait(index)
+		},
+		time.Duration(cfg.TokenTTL)*time.Second,
+	)
+	if err != nil {
+		if cfg.Logger != nil {
+			cfg.Logger.Warn("failed to create token provider", zap.Error(err))
+		} else {
+			plog.Warningf("failed to create token provider,err is %v", err)
+		}
+		return nil, err
+	}
+	srv.authStore = auth.NewAuthStore(srv.getLogger(), srv.be, tp, int(cfg.BcryptCost))
+
+	srv.kv = mvcc.New(srv.getLogger(), srv.be, srv.lessor, srv.authStore, &srv.consistIndex, mvcc.StoreConfig{CompactionBatchLimit: cfg.CompactionBatchLimit})
+	if beExist {
+		kvindex := srv.kv.ConsistentIndex()
+		// TODO: remove kvindex != 0 checking when we do not expect users to upgrade
+		// etcd from pre-3.0 release.
+		if snapshot != nil && kvindex < snapshot.Metadata.Index {
+			if kvindex != 0 {
+				return nil, fmt.Errorf("database file (%v index %d) does not match with snapshot (index %d)", bepath, kvindex, snapshot.Metadata.Index)
+			}
+			if cfg.Logger != nil {
+				cfg.Logger.Warn(
+					"consistent index was never saved",
+					zap.Uint64("snapshot-index", snapshot.Metadata.Index),
+				)
+			} else {
+				plog.Warningf("consistent index never saved (snapshot index=%d)", snapshot.Metadata.Index)
+			}
+		}
+	}
+	newSrv := srv // since srv == nil in defer if srv is returned as nil
+	defer func() {
+		// closing backend without first closing kv can cause
+		// resumed compactions to fail with closed tx errors
+		if err != nil {
+			newSrv.kv.Close()
+		}
+	}()
+
+	srv.consistIndex.setConsistentIndex(srv.kv.ConsistentIndex())
+	if num := cfg.AutoCompactionRetention; num != 0 {
+		srv.compactor, err = v3compactor.New(cfg.Logger, cfg.AutoCompactionMode, num, srv.kv, srv)
+		if err != nil {
+			return nil, err
+		}
+		srv.compactor.Run()
+	}
+
+	srv.applyV3Base = srv.newApplierV3Backend()
+	if err = srv.restoreAlarms(); err != nil {
+		return nil, err
+	}
+
+	if srv.Cfg.EnableLeaseCheckpoint {
+		// setting checkpointer enables lease checkpoint feature.
+		srv.lessor.SetCheckpointer(func(ctx context.Context, cp *pb.LeaseCheckpointRequest) {
+			srv.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseCheckpoint: cp})
+		})
+	}
+
+	// TODO: move transport initialization near the definition of remote
+	tr := &rafthttp.Transport{
+		Logger:      cfg.Logger,
+		TLSInfo:     cfg.PeerTLSInfo,
+		DialTimeout: cfg.peerDialTimeout(),
+		ID:          id,
+		URLs:        cfg.PeerURLs,
+		ClusterID:   cl.ID(),
+		Raft:        srv,
+		Snapshotter: ss,
+		ServerStats: sstats,
+		LeaderStats: lstats,
+		ErrorC:      srv.errorc,
+	}
+	if err = tr.Start(); err != nil {
+		return nil, err
+	}
+	// add all remotes into transport
+	for _, m := range remotes {
+		if m.ID != id {
+			tr.AddRemote(m.ID, m.PeerURLs)
+		}
+	}
+	for _, m := range cl.Members() {
+		if m.ID != id {
+			tr.AddPeer(m.ID, m.PeerURLs)
+		}
+	}
+	srv.r.transport = tr
+
+	return srv, nil
+}
+```
