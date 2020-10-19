@@ -282,4 +282,56 @@ func (st *storage) SaveSnap(snap raftpb.Snapshot) error {
 ```
 
 # 2. raftCluster 记录集群节点的状态
-todo
+```go
+// RaftCluster is a list of Members that belong to the same raft cluster
+type RaftCluster struct {
+	lg *zap.Logger
+
+	localID types.ID
+	cid     types.ID
+	token   string
+
+    // v2 版本的存储
+	v2store v2store.Store
+	// v3 版本的存储
+	be      backend.Backend
+
+	sync.Mutex // guards the fields below
+	version    *semver.Version
+	// 每个节点都会有一个id 和对应的一个 Member 实例
+	members    map[types.ID]*Member
+	// removed contains the ids of removed members in the cluster.
+	// removed id cannot be reused.
+	removed map[types.ID]bool
+}
+```
+已 AddMember 为例
+```go
+func (c *RaftCluster) AddMember(m *Member) {
+	c.Lock()
+	defer c.Unlock()
+	// 根据后端存储的版本来持久化 Member 信息
+	if c.v2store != nil {
+		mustSaveMemberToStore(c.v2store, m)
+	}
+	if c.be != nil {
+		mustSaveMemberToBackend(c.be, m)
+	}
+
+    // 补全 members 成员信息
+	c.members[m.ID] = m
+
+    // 打印相关信息
+	if c.lg != nil {
+		c.lg.Info(
+			"added member",
+			zap.String("cluster-id", c.cid.String()),
+			zap.String("local-member-id", c.localID.String()),
+			zap.String("added-peer-id", m.ID.String()),
+			zap.Strings("added-peer-peer-urls", m.PeerURLs),
+		)
+	} else {
+		plog.Infof("added member %s %v to cluster %s", m.ID, m.PeerURLs, c.cid)
+	}
+}
+```
