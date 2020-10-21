@@ -651,3 +651,89 @@ type ReadState struct {
 * 从以上可以看到客户端的只读请求最终会写入到客户端请求节点的readStates队列中，等待其他goroutine来处理，以上也是MsgReadIndex和MsgReadIndexResp类型消息的处理流程。
 * 上层应用的协程等待状态机应用的的index 打到 读请求时的index后，返回给客户端
 * 这里的linearizableReadLoop相当于是一把锁，控制读请求何时可以从状态机中读取最新数据。
+
+## MsgSnap
+如果 leader 向follower 发送 MsgApp时，如果查不到待发送的Entry，则会尝试发送Snap消息将快照给Folower，让你恢复
+```go
+func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
+	pr := r.prs.Progress[to]
+	if pr.IsPaused() {
+		return false
+	}
+	m := pb.Message{}
+	m.To = to
+
+	term, errt := r.raftLog.term(pr.Next - 1)
+	ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)
+	if len(ents) == 0 && !sendIfEmpty {
+		return false
+	}
+    // 找不到待发送的 entries，则发送 snap消息
+	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		m.Type = pb.MsgSnap
+		// 获取快照数据
+		snapshot, err := r.raftLog.snapshot()
+		// 封装消息
+		m.Snapshot = snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
+			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		pr.BecomeSnapshot(sindex)
+		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
+	} else {
+		...
+	}
+	r.send(m)
+	return true
+}
+```
+
+Follower 处理过程
+```go
+func (r *raft) handleSnapshot(m pb.Message) {
+	// 先获取快照的元数据信息
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	// 根据快照重建
+	if r.restore(m.Snapshot) {
+		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.raftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
+	} else {
+		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.raftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+	}
+}
+```
+```go
+func (r *raft) restore(s pb.Snapshot) bool {
+	// Now go ahead and actually restore.
+    // 根据快照数据的元数据查找 entry 记录，如果存在就不需要重建
+	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
+			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.raftLog.commitTo(s.Metadata.Index)
+		return false
+	}
+
+    // raftLog.unstable 记录快照数据
+	r.raftLog.restore(s)
+
+    // 重建 Progress 相关数据
+	// Reset the configuration and add the (potentially updated) peers in anew.
+	r.prs = tracker.MakeProgressTracker(r.prs.MaxInflight)
+	cfg, prs, err := confchange.Restore(confchange.Changer{
+		Tracker:   r.prs,
+		LastIndex: r.raftLog.lastIndex(),
+	}, cs)
+
+	assertConfStatesEquivalent(r.logger, cs, r.switchToConfig(cfg, prs))
+
+	pr := r.prs.Progress[r.id]
+	pr.MaybeUpdate(pr.Next - 1) // TODO(tbg): this is untested and likely unneeded
+
+	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
+		r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+	return true
+}
+```
