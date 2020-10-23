@@ -1059,3 +1059,8 @@ func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
 	}
 }
 ```
+
+### linearizableReadLoop
+* 先阻塞等待 readwaitc 通道的信号
+* 发送MsgReadIndex 消息给raft进行处理
+* 把 Ready中的ReadState 写入 readStateC 通道
