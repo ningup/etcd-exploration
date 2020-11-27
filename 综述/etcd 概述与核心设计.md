@@ -95,6 +95,10 @@ type Lease interface {
 	Close() error
 }
 ```
+* KeepAlive 自动无限续租
+    * grpc stream，创建协程无限续租，间隔500ms
+    * 如果 stream 失效， 500ms重试
+* KeepAliveOnce 续租一次
 #### Cluster  集群管理相关
 ```go
 type Cluster interface {
@@ -137,7 +141,43 @@ type LockServer interface {
 	Unlock(context.Context, *UnlockRequest) (*UnlockResponse, error)
 }
 ```
-etcdserver/api/v3lock/lock.go 通过 clientV3(concurrency) 实现 todo
+etcdserver/api/v3lock/lock.go 通过 clientV3(concurrency) 实现
+
+* 在 key prefix 下创建一个key，并不断续租
+* key prefix下的所有 key 有不同的revision，revision 最小的那个 key 将获得锁
+* revision 不是最小的 key 的持有者将阻塞，直到revision比它小的所有key都被删除时，它才获得锁
+
+核心逻辑：
+* lock
+```go
+func (m *Mutex) Lock(ctx context.Context) error {
+	s := m.s
+	client := m.s.Client()
+    //尝试抢锁客户端要创建的key的名字
+    m.myKey = fmt.Sprintf("%s%x", m.pfx, s.Lease())
+    // 事务，key不存在则创建，存在则get（重复使用已经持有的锁key）,并且都获取 prefix key的信息
+	cmp := v3.Compare(v3.CreateRevision(m.myKey), "=", 0)
+	put := v3.OpPut(m.myKey, "", v3.WithLease(s.Lease()))
+	get := v3.OpGet(m.myKey)
+    getOwner := v3.OpGet(m.pfx, v3.WithFirstCreate()...)
+    // 启动事务 
+    resp, err := client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
+    // 拿到当前的 revision，用于比较自己是否是最小的, 如果是最小的则抢锁成功
+	m.myRev = resp.Header.Revision
+	// if no key on prefix / the minimum rev is key, already hold the lock
+	ownerKey := resp.Responses[1].GetResponseRange().Kvs
+	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
+		m.hdr = resp.Header
+		return nil
+	}
+    // 如果没抢到就等待比自己小的key都删除
+	hdr, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
+	return werr
+}
+```
+* unlock: 把myKey删掉就行了
+
+
 #### Election 选举
 ```go
 type ElectionServer interface {
@@ -158,7 +198,7 @@ type ElectionServer interface {
 	Resign(context.Context, *ResignRequest) (*ResignResponse, error)
 }
 ```
-etcdserver/api/v3election/election.go 通过 clientV3(concurrency) 实现 todo
+etcdserver/api/v3election/election.go 通过 clientV3(concurrency) 
 
 ## etcd 应用场景
 
@@ -179,10 +219,12 @@ https://etcd.io/docs/v3.4.0/demo/
 ## 共识层（raft）
 ## 网络层 (raft-http)
 ## 存储层
-### WAL
-### SNAP
-### MVCC
-### LEASOR
-### WATCHER
-## ETCD-SERVER
-## ETCD-CLIENT
+### wal 
+### snap
+### mvcc
+### boltdb
+### leasor
+### watcher
+## etcd server
+## etcd client
+
