@@ -175,6 +175,7 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	return werr
 }
 ```
+问题： 如果 keyprefix下的key 被外部删除了，所有都认为自己抢锁成功
 * unlock: 把myKey删掉就行了
 
 
@@ -199,6 +200,58 @@ type ElectionServer interface {
 }
 ```
 etcdserver/api/v3election/election.go 通过 clientV3(concurrency) 
+
+选举
+
+1. etcd的选举也是在相应的prefix path下面创建key，该key绑定了lease 并根据 lease id进行命名
+2. key创建后就有revision号，这样使得在prefix path下的key也都是按revision有序
+3. 每个节点watch比自己createRevision小并且最大的节点，等到所有比自己createRevision小的节点都被删除后，自己才成为leader
+```go
+func (e *Election) Campaign(ctx context.Context, val string) error {
+	s := e.session
+	client := e.session.Client()
+	// 事务，如果if判断为true，那么put这个key，否则get这个key；最终都能获取到这个key的内容。
+	k := fmt.Sprintf("%s%x", e.keyPrefix, s.Lease())
+	txn := client.Txn(ctx).If(v3.Compare(v3.CreateRevision(k), "=", 0))
+	txn = txn.Then(v3.OpPut(k, val, v3.WithLease(s.Lease())))
+	txn = txn.Else(v3.OpGet(k))
+	resp, err := txn.Commit()
+
+	e.leaderKey, e.leaderRev, e.leaderSession = k, resp.Header.Revision, s
+	// key 已经存在，执行的事务的 else 分支
+	if !resp.Succeeded {
+		kv := resp.Responses[0].GetResponseRange().Kvs[0]
+		e.leaderRev = kv.CreateRevision
+		if string(kv.Value) != val {
+			// 判定val不相同，在不更换leader的情况下，更新val
+			if err = e.Proclaim(ctx, val); err != nil {
+				e.Resign(ctx)
+				return err
+			}
+		}
+	}
+
+    // 一直阻塞知道当前的revision最小,从而当选 leader
+	_, err = waitDeletes(ctx, client, e.keyPrefix, e.leaderRev-1)
+	return nil
+}
+```
+
+重新选举
+```go
+func (e *Election) Resign(ctx context.Context) (err error) {
+	if e.leaderSession == nil {
+		return nil
+	}
+	client := e.session.Client()
+	// 如果当前leaderkey的revision没有变化，就把节点删除，
+	cmp := v3.Compare(v3.CreateRevision(e.leaderKey), "=", e.leaderRev)
+	resp, err := client.Txn(ctx).If(cmp).Then(v3.OpDelete(e.leaderKey)).Commit()
+	e.leaderKey = ""
+	e.leaderSession = nil
+	return err
+}
+```
 
 ## etcd 应用场景
 
