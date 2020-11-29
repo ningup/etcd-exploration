@@ -1,131 +1,149 @@
 [TOC]
 
-# etcd 综述
-## etcd 是什么
+# 1 etcd 综述
+## 1.1 etcd 是什么
 官网定义： 
 1. Highly-avaliable key value store for shared configuration and service discovery
 2. A distributed, reliable key-value store for the most critical data of a distributed system
 * [性能测试](https://github.com/etcd-io/etcd/blob/master/Documentation/op-guide/performance.md#benchmarks)
 
-谁使用了 etcd：
-todo
+## 1.2 Adopters
+![](img/1.png)
 
-## etcd VS zookeeper
-http://blueskykong.com/2020/05/05/etcd-vs/#%E4%B8%8E-ZooKeeper
+## 1.3 etcd VS zookeeper
+主要解决的问题：
+* 元数据存储
+* 分布式协同
 
-## etcd API
+etcd 的设计简洁，运维简单，zk 设计的比较复杂（没研究过），**所以只列了 etcd 的优点**：
+* 支持线性读（支持读到最新数据）
+* 高负载下的读写性能稳定
+* 流式 Watcher，历史事件不会丢失，复用网络连接；zookeeper 是单次 watch，服务端接受到 watch 请求之前的事件丢失，每个 watch 请求使用新的连接
+* 客户端协议：
+    * zk 基于自定义的 Jute RPC， 限制了其他语言的支持
+	* etcd 基于 gRPC，其他语言开箱即用
+* 分布式协同原语维护方（分布式锁，选举，租约等）
+    * etcd: 官方维护
+	* zk: 通常使用 Curator。Curator是 Netflix 公司开源的一个Zookeeper客户端，Curator框架在zookeeper 原生 API 接口上进行了包装，解决了很多 ZooKeeper 客户端非常底层的细节开发
+
+## 1.4 版本控制 (MVCC)
+* 写操作都会创建新的版本
+* 读操作会从有限的多个版本中挑选一个最合适的（要么是最新版本，要么是指定版本)
+* 无需关心读写之间的冲突
+
+### 1.4.1 版本描述
+从 etcd 中描述 key value 可以看到：
+```go
+type KeyValue struct {
+	// key is the key in bytes. An empty key is not allowed.
+	Key []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// 该 key 最后一次时的 revision, （分布式锁就用了它）
+	CreateRevision int64 `protobuf:"varint,2,opt,name=create_revision,json=createRevision,proto3" json:"create_revision,omitempty"`
+	// 该 key 最后一次修改时的 revision
+	ModRevision int64 `protobuf:"varint,3,opt,name=mod_revision,json=modRevision,proto3" json:"mod_revision,omitempty"`
+	// 1. key 当前的版本
+	// 2. 任何对 key 的修改都会增加该值
+	// 3. 删除 key 会使该值归零
+	Version int64 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
+	// value is the value held by the key, in bytes.
+	Value []byte `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
+	// 赋予的租约id，如果是 0 代表没有租约
+	Lease int64 `protobuf:"varint,6,opt,name=lease,proto3" json:"lease,omitempty"`
+}
+```
+
+### 1.4.2 逻辑时钟 (revision)
+* int64 全局递增
+* 可以视为全局的逻辑时钟，任何键空间发生变化，revision 都会增加；指定 revision 操作时，理解为时钟回退到那个时刻
+* 用事务封装的操作，revision 在后台只会更改一次
+* revision值大的键值对一定是在revision值小键值对之后修改的
+
+## 1.5 etcd API
 rpc pb 描述
 * https://github.com/etcd-io/etcd/blob/release-3.4/etcdserver/etcdserverpb/rpc.proto
 * https://godoc.org/github.com/coreos/etcd/clientv3
 
-### 核心 API
-#### KV
+### 1.5.1 核心 API
+#### 1.5.1.1 KV
+(range, 线性读/串行读)
 ```go
-type KV interface {
-	// Put puts a key-value pair into etcd.
-	// Note that key,value can be plain bytes array and string is
-	// an immutable representation of that bytes array.
-	// To get a string of bytes, do string([]byte{0x10, 0x20}).
-	Put(ctx context.Context, key, val string, opts ...OpOption) (*PutResponse, error)
-
-	// Get retrieves keys.
-	// By default, Get will return the value for "key", if any.
-	// When passed WithRange(end), Get will return the keys in the range [key, end).
-	// When passed WithFromKey(), Get returns keys greater than or equal to key.
-	// When passed WithRev(rev) with rev > 0, Get retrieves keys at the given revision;
-	// if the required revision is compacted, the request will fail with ErrCompacted .
-	// When passed WithLimit(limit), the number of returned keys is bounded by limit.
-	// When passed WithSort(), the keys will be sorted.
-	Get(ctx context.Context, key string, opts ...OpOption) (*GetResponse, error)
-
-	// Delete deletes a key, or optionally using WithRange(end), [key, end).
-	Delete(ctx context.Context, key string, opts ...OpOption) (*DeleteResponse, error)
-
-	// Compact compacts etcd KV history before the given rev.
-	Compact(ctx context.Context, rev int64, opts ...CompactOption) (*CompactResponse, error)
-
-	// Do applies a single Op on KV without a transaction.
-	// Do is useful when creating arbitrary operations to be issued at a
-	// later time; the user can range over the operations, calling Do to
-	// execute them. Get/Put/Delete, on the other hand, are best suited
-	// for when the operation should be issued at the time of declaration.
-	Do(ctx context.Context, op Op) (OpResponse, error)
-
-	// Txn creates a transaction.   if/then/else  commit
-	Txn(ctx context.Context) Txn
+service KV {
+  // 从键值存储中获取范围内的key.
+  rpc Range(RangeRequest) returns (RangeResponse) {}
+​
+  // 放置给定key到键值存储.
+  rpc Put(PutRequest) returns (PutResponse) {}
+​
+  // 从键值存储中删除给定范围。
+  rpc DeleteRange(DeleteRangeRequest) returns (DeleteRangeResponse) {}
+​
+  // 在单个事务中处理多个请求。
+  // 不容许在一个txn中多次修改同一个key.
+  rpc Txn(TxnRequest) returns (TxnResponse) {}
+​
+  // 压缩在etcd键值存储中的事件历史。
+  // 键值存储应该定期压缩，否则事件历史会无限制的持续增长.
+  rpc Compact(CompactionRequest) returns (CompactionResponse) {}
 }
 ```
-#### Watch
+
+#### 1.5.1.2 Watch
+(复用连接、watch 范围/历史)
 ```go
-type Watcher interface {
-	Watch(ctx context.Context, key string, opts ...OpOption) WatchChan
-
-	// RequestProgress requests a progress notify response be sent in all watch channels.
-	RequestProgress(ctx context.Context) error
-
-	// Close closes the watcher and cancels all watch requests.
-	Close() error
+service Watch {
+  // Watch watches for events happening or that have happened. Both input and output
+  // are streams; the input stream is for creating and canceling watchers and the output
+  // stream sends events. One watch RPC can watch on multiple key ranges, streaming events
+  // for several watches at once. The entire event history can be watched starting from the
+  // last compaction revision.
+  // 1. Watch 检测将要发生或者已经发生的事件。
+  // 2. 输入流用于创建和取消观察，输出流发送事件。
+  // 3. 一个 RPC 可以在多个 key range 上 watch。
+  // 4. watch 可以在最后压缩修订版本开始观察。
+  rpc Watch(stream WatchRequest) returns (stream WatchResponse) {}}
 }
 ```
-#### Lease
+
+#### 1.5.1.3 Lease
+(有最小TTL/集群时钟不一致时ttl不准)
 ```go
-type Lease interface {
-	// Grant creates a new lease.
-	Grant(ctx context.Context, ttl int64) (*LeaseGrantResponse, error)
+service Lease {
+  // LeaseGrant 创建一个租约，当服务器在给定 time to live 时间内没有接收到 keepAlive 时租约过期。
+  // 如果租约过期则所有附加在租约上的key将过期并被删除。
+  // 每个过期的key在事件历史中生成一个删除事件。
+  rpc LeaseGrant(LeaseGrantRequest) returns (LeaseGrantResponse) {}
 
-	// Revoke revokes the given lease.
-	Revoke(ctx context.Context, id LeaseID) (*LeaseRevokeResponse, error)
+  // LeaseRevoke 撤销一个租约。
+  // 所有附加到租约的key将过期并被删除。
+  rpc LeaseRevoke(LeaseRevokeRequest) returns (LeaseRevokeResponse) {}
 
-	// TimeToLive retrieves the lease information of the given lease ID.
-	TimeToLive(ctx context.Context, id LeaseID, opts ...LeaseOption) (*LeaseTimeToLiveResponse, error)
+  // 续约
+  rpc LeaseKeepAlive(stream LeaseKeepAliveRequest) returns (stream LeaseKeepAliveResponse) {}
 
-	// Leases retrieves all leases.
-	Leases(ctx context.Context) (*LeaseLeasesResponse, error)
-
-    // KeepAlive attempts to keep the given lease alive forever.
-    // 自动续约
-	KeepAlive(ctx context.Context, id LeaseID) (<-chan *LeaseKeepAliveResponse, error)
-
-    // KeepAliveOnce renews the lease once.
-    // 续约一次
-	KeepAliveOnce(ctx context.Context, id LeaseID) (*LeaseKeepAliveResponse, error)
-
-	// Close releases all resources Lease keeps for efficient communication
-	// with the etcd server.
-	Close() error
+  // LeaseTimeToLive 获取租约信息。
+  rpc LeaseTimeToLive(LeaseTimeToLiveRequest) returns (LeaseTimeToLiveResponse) {}
 }
 ```
+
+clientV3：
 * KeepAlive 自动无限续租
     * grpc stream，创建协程无限续租，间隔500ms
     * 如果 stream 失效， 500ms重试
 * KeepAliveOnce 续租一次
-#### Cluster  集群管理相关
-```go
-type Cluster interface {
-	// MemberList lists the current cluster membership.
-	MemberList(ctx context.Context) (*MemberListResponse, error)
 
-	// MemberAdd adds a new member into the cluster.
-	MemberAdd(ctx context.Context, peerAddrs []string) (*MemberAddResponse, error)
+#### 1.5.1.4 Cluster
+集群管理相关 add/remove/update member/learner
 
-	// MemberAddAsLearner adds a new learner member into the cluster.
-	MemberAddAsLearner(ctx context.Context, peerAddrs []string) (*MemberAddResponse, error)
 
-	// MemberRemove removes an existing member from the cluster.
-	MemberRemove(ctx context.Context, id uint64) (*MemberRemoveResponse, error)
+#### 1.5.1.5 Maintenance
+维护相关操作(报警/后端碎片整理)
 
-	// MemberUpdate updates the peer addresses of the member.
-	MemberUpdate(ctx context.Context, id uint64, peerAddrs []string) (*MemberUpdateResponse, error)
+#### 1.5.1.6 Auth
+用户鉴权管理相关
 
-	// MemberPromote promotes a member from raft learner (non-voting) to raft voting member.
-	MemberPromote(ctx context.Context, id uint64) (*MemberPromoteResponse, error)
-}
-```
-#### Maintenance  维护相关操作
-#### Auth 用户即权限管理相关
-
-### 并发 API
-#### Lock 分布式锁
+### 1.5.2 并发 API
+[并发API官方文档](https://github.com/etcd-io/etcd/blob/master/Documentation/dev-guide/api_concurrency_reference_v3.md)
+#### 1.5.2.1 Lock 分布式锁
 ```go
 type LockServer interface {
 	// Lock acquires a distributed shared lock on a given named lock.
@@ -175,11 +193,11 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	return werr
 }
 ```
-问题： 如果 keyprefix下的key 被外部删除了，所有都认为自己抢锁成功
-* unlock: 把myKey删掉就行了
+问题： 如果 keyprefix下的 key 被外部删除了，所有都认为自己抢锁成功
+* unlock: 把 myKey 删掉就行了
 
 
-#### Election 选举
+#### 1.5.2.2 Election 选举
 ```go
 type ElectionServer interface {
 	// Campaign waits to acquire leadership in an election, returning a LeaderKey
@@ -253,31 +271,43 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 }
 ```
 
-## etcd 应用场景
+## 1.6 etcd 主要应用场景
 
 * 服务发现 (租约，心跳保持 )
 * 消息发布与订阅 (Watch)
 * 负载均衡 (利用服务发现维护可用服务列表，请求过来后轮询转发)
 * 分布式通知与协调 (Watch)
-* 分布式锁
-* Leader竞选（分布式锁）
+* 分布式锁 (最小的 create_revision)
+* 选举（分布式锁）
 
-## 版本控制
-## 实战演示
+## 1.7 Demo
 https://etcd.io/docs/v3.4.0/demo/
-* get/put/txn/watch/lease/status/compact
+* get/put
+* compact
+* txn
+* watch
+* lease
+* status
+```shell
+[DEV (v.v) sa_cluster@test1 ~]$ /sensorsdata/main/program/armada/etcd/bin/etcdctl endpoint status -w="table"  --endpoints=test1.sa:2379
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+|   ENDPOINT    |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+| test1.sa:2379 | 685785ec03d61bfd |  3.4.13 |   20 kB |      true |      false |         2 |          8 |                  8 |        |
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+```
 
-# 总体架构
-# 内部机制解析
-## 共识层（raft）
-## 网络层 (raft-http)
-## 存储层
-### wal 
-### snap
-### mvcc
-### boltdb
-### leasor
-### watcher
-## etcd server
-## etcd client
+# 2 总体架构
+# 3 内部机制解析
+## 3.1 共识层（raft）
+## 3.2 网络层 (raft-http)
+## 3.3 wal 
+## 3.4 snap
+## 3.5 存储层 (MVCC)
+## 3.6 持久层（boltdb）
+## 3.7 租约（leasor）
+## 3.8 监听（watcher）
+## 3.9 服务端（etcd server）
+## 3.10 客户端 （etcd client）
+
 
