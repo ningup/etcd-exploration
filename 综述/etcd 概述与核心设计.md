@@ -142,7 +142,7 @@ clientV3：
 用户鉴权管理相关
 
 ### 1.5.2 并发 API
-[并发API官方文档](https://github.com/etcd-io/etcd/blob/master/Documentation/dev-guide/api_concurrency_reference_v3.md)
+[并发 API 官方文档](https://github.com/etcd-io/etcd/blob/master/Documentation/dev-guide/api_concurrency_reference_v3.md)
 #### 1.5.2.1 Lock 分布式锁
 ```go
 type LockServer interface {
@@ -280,7 +280,18 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 * 分布式锁 (最小的 create_revision)
 * 选举（分布式锁）
 
-## 1.7 Demo
+## 1.7 高可用
+半数以上投票可选主（单节点特殊选主流程，直接为主）
+| 节点个数 | 高可用情况                                                                    |
+| -------- | ---------------------------------------------------------------------------------- |
+| 1        | 没有高可用，可以选主                                                     |
+| 2        | 没有高可用，能选主，如果挂掉一台，不能选主，活着的节点可以读（非一致性读），不能写 |
+| 3        | 允许挂1个                                                                      |
+| 4        | 允许挂1个                                                                      |
+| 5        | 允许挂2个                                                                      |
+| 6        | 允许挂2个                                                                      ||
+
+## 1.8 Demo
 https://etcd.io/docs/v3.4.0/demo/
 * get/put
 * compact
@@ -288,6 +299,7 @@ https://etcd.io/docs/v3.4.0/demo/
 * watch
 * lease
 * status
+
 ```shell
 [DEV (v.v) sa_cluster@test1 ~]$ /sensorsdata/main/program/armada/etcd/bin/etcdctl endpoint status -w="table"  --endpoints=test1.sa:2379
 +---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
@@ -298,8 +310,72 @@ https://etcd.io/docs/v3.4.0/demo/
 ```
 
 # 2 总体架构
+
 # 3 内部机制解析
-## 3.1 共识层（etcd-raft）
+## 3.1 共识层（etcd-raft/node）
+### 3.1.1 主流程 (Node 读写流程)
+https://wingsxdu.com/post/database/etcd/#gsc.tab=0
+
+![](../源码分析/img/7.png)
+
+### 3.1.2 状态机复制
+* 多副本，高可用
+* 副本之间同步问题
+
+### 3.1.3 协同日志管理 RaftLog
+raft 的核心能力就是为应用层提供序列相同的 Entry, Entry就是每一个操作项
+```go
+type Entry struct {
+	// 任期
+	Term             uint64    `protobuf:"varint,2,opt,name=Term" json:"Term"`
+	// 每一个Entry都有一个的Index，代表当前Entry在log entry序列中的位置，每个index上最终只有1个达成共识的Entry。
+	Index            uint64    `protobuf:"varint,3,opt,name=Index" json:"Index"`
+	// 表明当前Entry的类型，EntryNormal/EntryConfChange/EntryConfChangeV2
+	Type             EntryType `protobuf:"varint,1,opt,name=Type,enum=raftpb.EntryType" json:"Type"`
+	// 序列化的数据
+	Data             []byte    `protobuf:"bytes,4,opt,name=Data" json:"Data,omitempty"`
+}
+```
+```go
+type raftLog struct {
+	// storage contains all stable entries since the last snapshot.
+	storage Storage
+
+	// unstable contains all unstable entries and snapshot.
+	// they will be saved into storage.
+	unstable unstable
+
+	// committed is the highest log position that is known to be in
+	// stable storage on a quorum of nodes.
+	committed uint64
+	// applied is the highest log position that the application has
+	// been instructed to apply to its state machine.
+	// Invariant: applied <= committed
+	applied uint64
+
+	logger Logger
+
+	// maxNextEntsSize is the maximum number aggregate byte size of the messages
+	// returned from calls to nextEnts.
+	maxNextEntsSize uint64
+}
+```
+
+### 3.1.4 选举流程（状态切换）
+	electionElapsed int
+
+	// number of ticks since it reached last heartbeatTimeout.
+	// only leader keeps heartbeatElapsed.
+	heartbeatElapsed int
+
+	checkQuorum bool
+	preVote     bool
+
+	heartbeatTimeout int
+	electionTimeout  int
+
+### 3.1.5 消息处理
+
 ## 3.2 网络层 (raft-http)
 ## 3.3 wal 
 ## 3.4 snap
