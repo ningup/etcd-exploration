@@ -313,44 +313,138 @@ https://etcd.io/docs/v3.4.0/demo/
 
 # 3 内部机制解析
 ## 3.1 共识层（etcd-raft/node）
-### 3.1.1 主流程 (Node 读写流程)
-https://wingsxdu.com/post/database/etcd/#gsc.tab=0
-
+### 3.1.1 主流程
 ![](../源码分析/img/7.png)
 
 ### 3.1.2 状态机复制
-* 多副本，高可用
-* 副本之间同步问题
+![](../基础知识/img/2.png)
 
-### 3.1.3 协同日志管理 RaftLog
-raft 的核心能力就是为应用层提供序列相同的 Entry, Entry就是每一个操作项
+* 解决问题：分布式高可用，多副本。
+* 基本假设：如果状态机拥有相同的初始状态，接收到相同的命令，处理这些命令的顺序也相同，那么最终状态就会相同。
+
+### 3.1.3 选举流程（状态切换）
+![](img/2.png)
+
+注意点
+* Follower 拒绝投票给日志没有自己新的 candidate，保证能够成为 Leader 的 candidate 一定包含最新的日志
+* Learner： 新加入集群节点，不参与抢主，防止长时间同步日志， Leader直接向其发送快照
+* PreVote：防止网络分区，不够半数以上的分区无限发起选举，因此必须能够和半数以上的节点连接成功的节点才能成为 candidate
+
+#### becomeFollower()
+主要工作是设置 raft 各类变量
+```go
+func (r *raft) becomeFollower(term uint64, lead uint64) {
+	// 处理消息的函数指针
+	r.step = stepFollower
+	r.reset(term)
+	// 推进时钟计时器方法为 竞选计时器
+	r.tick = r.tickElection
+	r.lead = lead
+	r.state = StateFollower
+	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
+}
+```
+成为 follower 后，会被上层应用定期触发 tick，推进检测时钟是否超时
+```go
+func (r *raft) tickElection() {
+	r.electionElapsed++
+    // 超时
+	if r.promotable() && r.pastElectionTimeout() {
+		r.electionElapsed = 0
+		// 触发选举，后边会介绍各类消息处理流程
+		r.Step(pb.Message{From: r.id, Type: pb.MsgHup})
+	}
+}
+```
+
+#### becomeCandidate()
+当 follower 连接数大于一半时调用 becomeCandidate() 成为候选
+```go
+func (r *raft) becomeCandidate() {
+	// TODO(xiangli) remove the panic when the raft implementation is stable
+	if r.state == StateLeader {
+		panic("invalid transition [leader -> candidate]")
+	}
+	r.step = stepCandidate
+	r.reset(r.Term + 1)
+	r.tick = r.tickElection
+	r.Vote = r.id
+	r.state = StateCandidate
+	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
+}
+```
+
+#### becomeLeader()
+当 candidate 投票超过半数，则调用 becomeLeader 
+```go
+func (r *raft) becomeLeader() {
+	// TODO(xiangli) remove the panic when the raft implementation is stable
+	if r.state == StateFollower {
+		panic("invalid transition [follower -> leader]")
+	}
+	r.step = stepLeader
+	r.reset(r.Term)
+	r.tick = r.tickHeartbeat
+	r.lead = r.id
+	r.state = StateLeader
+
+	r.prs.Progress[r.id].BecomeReplicate()
+
+	r.pendingConfIndex = r.raftLog.lastIndex()
+
+	emptyEnt := pb.Entry{Data: nil}
+	// 向当前节点追加一条空entry记录
+	// 当一个节点成为 Leader 后会立即提交一条空日志，将自身携带的所有日志都设置为提交状态，该日志条目之前的所有日志条目也都会被提交，包括由其它 Leader 创建但还没有提交的日志条目，然后向集群内的其它节点同步。
+	if !r.appendEntry(emptyEnt) {
+		// This won't happen because we just called reset() above.
+		r.logger.Panic("empty entry was dropped")
+	}
+
+	r.reduceUncommittedSize([]pb.Entry{emptyEnt})
+	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
+```
+
+### 3.1.4 日志
+Entry: 每一个操作项, raft 的核心能力就是为应用层提供序列相同的 Entry
 ```go
 type Entry struct {
 	// 任期
-	Term             uint64    `protobuf:"varint,2,opt,name=Term" json:"Term"`
+	Term             uint64
 	// 每一个Entry都有一个的Index，代表当前Entry在log entry序列中的位置，每个index上最终只有1个达成共识的Entry。
-	Index            uint64    `protobuf:"varint,3,opt,name=Index" json:"Index"`
+	Index            uint64
 	// 表明当前Entry的类型，EntryNormal/EntryConfChange/EntryConfChangeV2
-	Type             EntryType `protobuf:"varint,1,opt,name=Type,enum=raftpb.EntryType" json:"Type"`
-	// 序列化的数据
-	Data             []byte    `protobuf:"bytes,4,opt,name=Data" json:"Data,omitempty"`
+	Type             EntryType
+	// 序列化的数据, 如果是 entry normal 为键值对
+	Data             []byte
 }
+
+const (
+	EntryNormal       EntryType = 0
+	EntryConfChange   EntryType = 1
+	EntryConfChangeV2 EntryType = 2
+)
 ```
+
+RaftLog: 本地Log，管理节点 Entry
 ```go
 type raftLog struct {
 	// storage contains all stable entries since the last snapshot.
+	//每次都从磁盘文件读取这些数据，效率必然是不高的，所以etcd/raft内定义了MemoryStorage，它实现了Storage接口，并且提供了函数来维护最新快照后的Entry
 	storage Storage
 
 	// unstable contains all unstable entries and snapshot.
 	// they will be saved into storage.
+	// 由于 Entry 的存储是由应用层负责的，所以raft需要暂时存储还未存到Storage中的Entry或者Snapshot，在创建Ready时，Entry和Snapshot会被封装到Ready，由应用层写入到storage
 	unstable unstable
 
 	// committed is the highest log position that is known to be in
 	// stable storage on a quorum of nodes.
+	// 最后一个在raft集群多数节点之间达成一致的Entry Index。
 	committed uint64
 	// applied is the highest log position that the application has
 	// been instructed to apply to its state machine.
 	// Invariant: applied <= committed
+	// 当前节点被应用层应用到状态机的最后一个Entry Index。applied和committed之间的Entry就是等待被应用层应用到状态机的Entry。
 	applied uint64
 
 	logger Logger
@@ -360,21 +454,300 @@ type raftLog struct {
 	maxNextEntsSize uint64
 }
 ```
-
-### 3.1.4 选举流程（状态切换）
-	electionElapsed int
-
-	// number of ticks since it reached last heartbeatTimeout.
-	// only leader keeps heartbeatElapsed.
-	heartbeatElapsed int
-
-	checkQuorum bool
-	preVote     bool
-
-	heartbeatTimeout int
-	electionTimeout  int
+raftLog 物理视图
+![](../源码分析/img/8.png)
 
 ### 3.1.5 消息处理
+节点间通讯的结构体
+```go
+type Message struct {
+	Type             MessageType `protobuf:"varint,1,opt,name=type,enum=raftpb.MessageType" json:"type"`
+	To               uint64      `protobuf:"varint,2,opt,name=to" json:"to"`
+	From             uint64      `protobuf:"varint,3,opt,name=from" json:"from"`
+	Term             uint64      `protobuf:"varint,4,opt,name=term" json:"term"`
+	// 创建Message时，发送节点本地所保存的log entry序列中最大的Term，在选举的时候会使用。
+	LogTerm          uint64      `protobuf:"varint,5,opt,name=logTerm" json:"logTerm"`
+	// 不同的消息类型，Index的含义不同。Term和Index与Entry中的Term和Index不一定会相同，因为某个follower可能比较慢，leader向follower发送已经committed的Entry。
+	Index            uint64      `protobuf:"varint,6,opt,name=index" json:"index"`
+	// 发送给 follower 待处理的 entries
+	Entries          []Entry     `protobuf:"bytes,7,rep,name=entries" json:"entries"`
+	// 消息发送节点提交的位置
+	Commit           uint64      `protobuf:"varint,8,opt,name=commit" json:"commit"`
+	// leader 传递给follower 的 snapshot
+	Snapshot         Snapshot    `protobuf:"bytes,9,opt,name=snapshot" json:"snapshot"`
+	Reject           bool        `protobuf:"varint,10,opt,name=reject" json:"reject"`
+	RejectHint       uint64      `protobuf:"varint,11,opt,name=rejectHint" json:"rejectHint"`
+	Context          []byte      `protobuf:"bytes,12,opt,name=context" json:"context,omitempty"`
+	XXX_unrecognized []byte      `json:"-"`
+}
+
+const (
+	// 选举计时器超时创建的消息，触发选举
+	MsgHup            MessageType = 0
+	MsgBeat           MessageType = 1
+	MsgProp           MessageType = 2
+	MsgApp            MessageType = 3
+	MsgAppResp        MessageType = 4
+	MsgVote           MessageType = 5
+	MsgVoteResp       MessageType = 6
+	MsgSnap           MessageType = 7
+	MsgHeartbeat      MessageType = 8
+	MsgHeartbeatResp  MessageType = 9
+	MsgUnreachable    MessageType = 10
+	MsgSnapStatus     MessageType = 11
+	MsgCheckQuorum    MessageType = 12
+	MsgTransferLeader MessageType = 13
+	MsgTimeoutNow     MessageType = 14
+	MsgReadIndex      MessageType = 15
+	MsgReadIndexResp  MessageType = 16
+	MsgPreVote        MessageType = 17
+	MsgPreVoteResp    MessageType = 18
+)
+```
+#### 3.1.5.1 MsgHup
+Follower 的选举计时器超时会创建 MsgHup 消息并调用 raft.Step()方法处理，该方法是各类消息处理的入口
+```go
+func (r *raft) Step(m pb.Message) error {
+	switch m.Type {
+	case pb.MsgHup:
+	    // 非leader 才会处理
+		if r.state != StateLeader {
+            // 获取提交但是慰应用的 entry
+			ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
+            // 检测是否有 confchange，有的话放弃选举 
+			if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
+				r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				return nil
+			}
+
+			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
+			// 调用 campaign 进行角色切换
+			if r.preVote {
+				r.campaign(campaignPreElection)
+			} else {
+				r.campaign(campaignElection)
+			}
+		} else {
+			r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
+		}
+    // 其他先不关心
+	return nil
+}
+```
+campaign 除了完成状态切换，也会向其他节点发起同类消息
+```go
+func (r *raft) campaign(t CampaignType) {
+	// 方法最后会发送一条消息
+	var term uint64
+	var voteMsg pb.MessageType
+	if t == campaignPreElection {
+         ...
+    // 切换成候选
+	} else {
+		r.becomeCandidate()
+		// 向其他节点发起投票消息
+		voteMsg = pb.MsgVote
+		term = r.Term
+	}
+	// 统计节点收到的选票，这里考虑的是单节点场景，投票给自己之后就能赢得选举
+	if _, _, res := r.poll(r.id, voteRespMsgType(voteMsg), true); res == quorum.VoteWon {
+		// We won the election after voting for ourselves (which must mean that
+		// this is a single-node cluster). Advance to the next state.
+		if t == campaignPreElection {
+			r.campaign(campaignElection)
+        // 票数足够，成为 leader
+		} else {
+			r.becomeLeader()
+		}
+		return
+	}
+	
+	for _, id := range ids {
+		if id == r.id {
+			continue
+		}
+		r.logger.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
+			r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), voteMsg, id, r.Term)
+
+		var ctx []byte
+		if t == campaignTransfer {
+			ctx = []byte(t)
+		}
+		// 想其他节点发送消息，主要只是追加到 raft.msg 里, 待上层应用发送
+		r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
+	}
+}
+```
+
+#### 3.1.5.2 MsgAPP
+Follower 收到 msgapp 消息后会调用 handleAppendEntries 把日志追加到自己的 raftLog 里
+```go
+func (r *raft) handleAppendEntries(m pb.Message) {
+	// 如果 index 已经提交了就不追加了
+	if m.Index < r.raftLog.committed {
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		return
+	}
+
+    // 追加到 raftLog 里
+	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
+	} else {
+		r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
+			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})
+	}
+}
+```
+
+#### 3.1.5.3 MsgProc
+客户端的写请求通过 MsgProc 发送给 Leader，响应该消息的方法是 stepLeader()
+```go
+func stepLeader(r *raft, m pb.Message) error {
+	// These message types do not require any progress for m.From.
+	switch m.Type {
+	case pb.MsgProp:
+        // 将上述消息 append 到 raftlog 里
+		if !r.appendEntry(m.Entries...) {
+			return ErrProposalDropped
+		}
+		// 通过 MsgApp 消息向Follower节点复制
+		r.bcastAppend()
+		return nil
+	}
+}
+```
+
+### 3.1.6 总结
+raft 本身没有实现网络层，持久化，这些都交给了上层应用来做
+* 消息发送只是缓存在  ```msgs []pb.Message```, 上层来发送
+* Entry 持久化缓存在 raftLog 里， 上层应用来持久化本地以及 把 unstable 写入到 Storage
+
+### 3.1.7 集群中的节点 Node
+* 它是 raft 对上层应用的一层封装
+* 衔接应用层和 Raft 模块的消息传输，将应用层的消息传递给 Raft 模块，并将 raft 模块处理后的结果反馈给应用层
+
+```go
+type node struct {
+	propc      chan msgWithResult
+	recvc      chan pb.Message
+	confc      chan pb.ConfChangeV2
+	confstatec chan pb.ConfState
+	readyc     chan Ready
+	advancec   chan struct{}
+	tickc      chan struct{}
+	done       chan struct{}
+	stop       chan struct{}
+	status     chan chan Status
+
+	rn *RawNode
+}
+```
+用于处理 node 对象的各类通道，一个后台go协程
+```go
+func (n *node) run() {
+	var propc chan msgWithResult
+	var readyc chan Ready
+	var advancec chan struct{}
+	var rd Ready
+
+	r := n.rn.raft
+
+	lead := None
+
+	for {
+		// 上层模块还没有处理完，因此不需要往 ready 通道写入数据
+		if advancec != nil {
+			readyc = nil
+
+		} else if n.rn.HasReady() {
+            // 构造 ready
+			rd = n.rn.readyWithoutAccept()
+			readyc = n.readyc
+		}
+
+		select {
+        // 读取 propc 通道，获取 MsgPropc 消息，交给 raft.step() 处理
+		case pm := <-propc:
+			m := pm.m
+			m.From = r.id
+			err := r.Step(m)
+        // 读取 recvc通道，获取非 MsgPropc 消息类型，交给 raft.step()  处理
+		case m := <-n.recvc:
+			// filter out response message from unknown From.
+			if pr := r.prs.Progress[m.From]; pr != nil || !IsResponseMsg(m.Type) {
+				r.Step(m)
+			}
+        // 读取 ConfChange 实例 进行处理
+		case cc := <-n.confc:
+		   ...
+        // 逻辑时钟推进一次，调用 raft.tick() 进行时钟推进
+		case <-n.tickc:
+			n.rn.Tick()
+        // 将创建好的 Ready 对象写入 readyc 通道，等待上层使用
+		case readyc <- rd:
+			n.rn.acceptReady(rd)
+			advancec = n.advancec
+        // 上层模块处理完 Ready 实例的信号
+		case <-advancec:
+			n.rn.Advance(rd)
+			rd = Ready{}
+			advancec = nil
+		case c := <-n.status:
+			c <- getStatus(r)
+		case <-n.stop:
+			close(n.done)
+			return
+		}
+	}
+}
+```
+
+raft 使用 Ready 对外传递数据，上层引用处理完一个后调用 Advance(), 通知 raft 产生下一个 ready
+```go
+type Ready struct {
+	// The current volatile state of a Node.
+	// SoftState will be nil if there is no update.
+	// It is not required to consume or store SoftState.
+	*SoftState
+
+	// The current state of a Node to be saved to stable storage BEFORE
+	// Messages are sent.
+	// HardState will be equal to empty state if there is no update.
+	pb.HardState
+
+	// ReadStates can be used for node to serve linearizable read requests locally
+	// when its applied index is greater than the index in ReadState.
+	// Note that the readState will be returned when raft receives msgReadIndex.
+	// The returned is only valid for the request that requested to read.
+	ReadStates []ReadState
+
+	// Entries specifies entries to be saved to stable storage BEFORE
+	// Messages are sent.
+	// Entries保存的是从unstable读取的Entry，它们即将被应用层写入storage
+	Entries []pb.Entry
+
+	// Snapshot specifies the snapshot to be saved to stable storage.
+	Snapshot pb.Snapshot
+
+	// CommittedEntries specifies entries to be committed to a
+	// store/state-machine. These have previously been committed to stable
+	// store.
+	// 已经被 Committed，还没有applied，应用层会把他们应用到状态机。
+	CommittedEntries []pb.Entry
+
+	// Messages specifies outbound messages to be sent AFTER Entries are
+	// committed to stable storage.
+	// If it contains a MsgSnap message, the application MUST report back to raft
+	// when the snapshot has been received or has failed by calling ReportSnapshot.
+	// 需要处理的消息
+	Messages []pb.Message
+
+	// MustSync indicates whether the HardState and Entries must be synchronously
+	// written to disk or if an asynchronous write is permissible.
+	MustSync bool
+}
+```
 
 ## 3.2 网络层 (raft-http)
 ## 3.3 wal 
