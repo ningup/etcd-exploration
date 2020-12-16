@@ -313,16 +313,13 @@ https://etcd.io/docs/v3.4.0/demo/
 
 # 3 内部机制解析
 ## 3.1 共识层（etcd-raft/node）
-### 3.1.1 主流程
-![](../源码分析/img/7.png)
-
-### 3.1.2 状态机复制
+### 3.1.1 状态机复制
 ![](../基础知识/img/2.png)
 
 * 解决问题：分布式高可用，多副本。
 * 基本假设：如果状态机拥有相同的初始状态，接收到相同的命令，处理这些命令的顺序也相同，那么最终状态就会相同。
 
-### 3.1.3 选举流程（状态切换）
+### 3.1.2 选举流程（状态切换）
 ![](img/2.png)
 
 注意点
@@ -404,7 +401,7 @@ func (r *raft) becomeLeader() {
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 ```
 
-### 3.1.4 日志
+### 3.1.3 日志
 Entry: 每一个操作项, raft 的核心能力就是为应用层提供序列相同的 Entry
 ```go
 type Entry struct {
@@ -457,7 +454,7 @@ type raftLog struct {
 raftLog 物理视图
 ![](../源码分析/img/8.png)
 
-### 3.1.5 消息处理
+### 3.1.4 消息处理
 节点间通讯的结构体
 ```go
 type Message struct {
@@ -504,7 +501,7 @@ const (
 	MsgPreVoteResp    MessageType = 18
 )
 ```
-#### 3.1.5.1 MsgHup
+#### MsgHup
 Follower 的选举计时器超时会创建 MsgHup 消息并调用 raft.Step()方法处理，该方法是各类消息处理的入口
 ```go
 func (r *raft) Step(m pb.Message) error {
@@ -579,7 +576,7 @@ func (r *raft) campaign(t CampaignType) {
 }
 ```
 
-#### 3.1.5.2 MsgAPP
+#### MsgAPP
 Follower 收到 msgapp 消息后会调用 handleAppendEntries 把日志追加到自己的 raftLog 里
 ```go
 func (r *raft) handleAppendEntries(m pb.Message) {
@@ -600,7 +597,7 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 }
 ```
 
-#### 3.1.5.3 MsgProc
+#### MsgProc
 客户端的写请求通过 MsgProc 发送给 Leader，响应该消息的方法是 stepLeader()
 ```go
 func stepLeader(r *raft, m pb.Message) error {
@@ -618,12 +615,12 @@ func stepLeader(r *raft, m pb.Message) error {
 }
 ```
 
-### 3.1.6 总结
+### 3.1.5 总结
 raft 本身没有实现网络层，持久化，这些都交给了上层应用来做
 * 消息发送只是缓存在  ```msgs []pb.Message```, 上层来发送
 * Entry 持久化缓存在 raftLog 里， 上层应用来持久化本地以及 把 unstable 写入到 Storage
 
-### 3.1.7 集群中的节点 Node
+### 3.1.6 集群中的节点 Node
 * 它是 raft 对上层应用的一层封装
 * 衔接应用层和 Raft 模块的消息传输，将应用层的消息传递给 Raft 模块，并将 raft 模块处理后的结果反馈给应用层
 
@@ -748,6 +745,123 @@ type Ready struct {
 	MustSync bool
 }
 ```
+
+### 3.1.7 工作流
+#### 主流程
+![](img/3.png)
+1. 客户端向 etcd 集群发送一次写请求，请求中封装成 Entry 日志，交给 Raft 处理，Raft 模块先将 Entry 保存到 unstable 中
+2. Raft 模块将该 Entry 日志封装到 Ready 实例中，返回给上层模块进行持久化
+3. 上层应用收到待持久化的 Entry 日志之后，先将其写入 WAL 文件，然后向集群中的其它节点广播这一条数据
+4. 上层应用通知 raft 模块将该 Entry 日志从 unstable 『移动』到 MemoryStorage；
+5. 该 Entry 日志被复制到集群半数以上的节点时，该 Entry 日志会被 Leader 节点确认为己提交，Leader 会回复客户端写请求操作成功，并将 Entry 日志再次封装进 Ready 实例返回给上层模块；
+6. 上层模块将该 Ready 实例中携带的待应用 Entry 日志应用到状态机中。
+7. 上层应用通知 raft 模块将该 Entry 日志应用到 storage 
+
+#### 数据流
+![](img/4.png)
+
+```go
+func (rc *raftNode) serveChannels() {
+    // 根据前边已经回放日志好的信息，读取快照信息
+	snap, err := rc.raftStorage.Snapshot()
+
+	rc.confState = snap.Metadata.ConfState
+	rc.snapshotIndex = snap.Metadata.Index
+	rc.appliedIndex = snap.Metadata.Index
+
+	defer rc.wal.Close()
+
+    // 创建一个定时器，每100ms触发一次，这个是 etcd-raft 最小的时间单位(逻辑时钟)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// send proposals over raft
+	go func() {
+		confChangeCount := uint64(0)
+
+		for rc.proposeC != nil && rc.confChangeC != nil {
+			select {
+			case prop, ok := <-rc.proposeC:
+                // blocks until accepted by raft state machine
+                // 通过 raft 的 node 把客户端传过来的数据请求交给 etcd-raft
+                rc.node.Propose(context.TODO(), []byte(prop))
+
+            case cc, ok := <-rc.confChangeC:
+                // 统计集群变更请求的次数
+                confChangeCount++
+                cc.ID = confChangeCount
+                // 同理， 通过 raft 的 node 把客户端传过来集群变更请求交给 etcd-raft
+                rc.node.ProposeConfChange(context.TODO(), cc)
+			}
+		}
+		// client closed channel; shutdown raft if not already
+		close(rc.stopc)
+	}()
+
+    // event loop on raft state machine updates
+    // 下边的循环负责处理底层raft返回来的 ready 数据，
+	for {
+		select {
+        // 推进 raft 逻辑时钟
+		case <-ticker.C:
+			rc.node.Tick()
+
+		// store raft entries to wal, then publish over commit channel
+        case rd := <-rc.node.Ready():
+            /*
+                1. 将 底层 raft 传过来的状态信息，待持久化的 Entries 等记录到 wal 日志，即使宕机这些信息也可以再下次重启节点后回放日志
+            */
+            rc.wal.Save(rd.HardState, rd.Entries)
+            // 产生了新的快照
+			if !raft.IsEmptySnap(rd.Snapshot) {
+                // 保存快照
+                rc.saveSnap(rd.Snapshot)
+                // 新快照写到 Storage 里
+                rc.raftStorage.ApplySnapshot(rd.Snapshot)
+                // 通知上层应用加载新快照
+				rc.publishSnapshot(rd.Snapshot)
+            }
+            // 将待持久化的 Entries 持久化到 Storage 里
+            rc.raftStorage.Append(rd.Entries)
+            // 将待发送的消息发送到指定节点
+            rc.transport.Send(rd.Messages)
+            // 将已经提交待应用的 Entry 记录到上层应用的状态机里
+			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
+				rc.stop()
+				return
+            }
+            // 尝试触发快照
+            rc.maybeTriggerSnapshot()
+            // 处理完 Ready，通知底层 etcd-raft准备下一个 Ready 实例
+			rc.node.Advance()
+
+		case err := <-rc.transport.ErrorC:
+			rc.writeError(err)
+			return
+
+		case <-rc.stopc:
+			rc.stop()
+			return
+		}
+	}
+}
+```
+* 负责监听 proposeC 和 confChangeC 两个通道，将从通道传来的信息传给底层 raft 处理
+* 处理底层 raft 返回的 Ready 数据，包括了已经准备好读取、持久化、提交或者发送给 follower 的 entries 和 messages 等信息
+* 配置了一个定时器，定时器到期时调用节点的 Tick() 方法推动 raft 逻辑时钟前
+
+#### 客户端请求
+![](img/5.png)
+
+#### 接收消息
+![](img/6.png)
+
+1. 从Network收到消息，可以是leader给follower的消息，也可以是follower发给leader的响应消息，Network的handler函数将数据回传给raftNode
+2. raftNode调用Step函数，将数据发给raft，数据被写入recvc通道
+3. raft的Step从recvc收到消息，并修改raftLog中的日志
+
+#### 应用日志
+![](img/7.png)
 
 ## 3.2 网络层 (raft-http)
 ## 3.3 wal 
