@@ -504,7 +504,7 @@ const (
 	MsgPreVoteResp    MessageType = 18
 )
 ```
-#### 3.1.5.1 MsgHup
+#### MsgHup
 Follower 的选举计时器超时会创建 MsgHup 消息并调用 raft.Step()方法处理，该方法是各类消息处理的入口
 ```go
 func (r *raft) Step(m pb.Message) error {
@@ -579,7 +579,7 @@ func (r *raft) campaign(t CampaignType) {
 }
 ```
 
-#### 3.1.5.2 MsgAPP
+#### MsgAPP
 Follower 收到 msgapp 消息后会调用 handleAppendEntries 把日志追加到自己的 raftLog 里
 ```go
 func (r *raft) handleAppendEntries(m pb.Message) {
@@ -600,7 +600,7 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 }
 ```
 
-#### 3.1.5.3 MsgProc
+#### MsgProc
 客户端的写请求通过 MsgProc 发送给 Leader，响应该消息的方法是 stepLeader()
 ```go
 func stepLeader(r *raft, m pb.Message) error {
