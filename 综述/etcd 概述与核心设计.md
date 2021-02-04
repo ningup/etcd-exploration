@@ -7,24 +7,29 @@
 2. A distributed, reliable key-value store for the most critical data of a distributed system
 * [性能测试](https://github.com/etcd-io/etcd/blob/master/Documentation/op-guide/performance.md#benchmarks)
 
+### 1.1.1 etcd v2 发布时间轴
+![](img/8.png)
+
+### 1.1.2 etcd v3 发布时间轴
+![](img/9.png)
+
 ## 1.2 Adopters
 ![](img/1.png)
 
 ## 1.3 etcd VS zookeeper
-主要解决的问题：
+### 1.3.1 主要解决的问题：
 * 元数据存储
 * 分布式协同
 
-etcd 的设计简洁，运维简单，zk 设计的比较复杂（没研究过），**所以只列了 etcd 的优点**：
+### 1.3.2 etcd 的优点
 * 支持线性读（支持读到最新数据）
-* 高负载下的读写性能稳定
-* 流式 Watcher，历史事件不会丢失，复用网络连接；zookeeper 是单次 watch，服务端接受到 watch 请求之前的事件丢失，每个 watch 请求使用新的连接
+* **流式 Watcher**，历史事件**通常**不会丢失，复用网络连接；zookeeper 是单次 watch，服务端接受到 watch 请求之前的事件丢失，每个 watch 请求使用新的连接
 * 通讯协议：
     * zk 基于自定义的 Jute 协议， 其他语言的支持困难
 	* etcd 基于 gRPC，其他语言开箱即用
 * 分布式协同原语维护方（分布式锁，选举，租约等）
-    * etcd: 官方维护
-	* zk: 通常使用 Curator。Curator是 Netflix 公司开源的一个Zookeeper客户端，Curator框架在zookeeper 原生 API 接口上进行了包装，解决了很多 ZooKeeper 客户端非常底层的细节开发
+    * etcd 是 官方维护
+	* zk 通常使用 Curator。Curator是 Netflix 公司开源的一个Zookeeper客户端，Curator框架在zookeeper 原生 API 接口上进行了包装，解决了很多 ZooKeeper 客户端非常底层的细节开发
 
 ## 1.4 版本控制 (MVCC)
 * 写操作都会创建新的版本
@@ -59,7 +64,6 @@ type KeyValue struct {
 * revision值大的键值对一定是在revision值小键值对之后修改的
 
 ## 1.5 etcd API
-rpc pb 描述
 * https://github.com/etcd-io/etcd/blob/release-3.4/etcdserver/etcdserverpb/rpc.proto
 * https://godoc.org/github.com/coreos/etcd/clientv3
 
@@ -310,6 +314,7 @@ https://etcd.io/docs/v3.4.0/demo/
 ```
 
 # 2 总体架构
+![](img/10.png)
 
 # 3 内部机制解析
 ## 3.1 共识层（etcd-raft/node）
@@ -864,13 +869,113 @@ func (rc *raftNode) serveChannels() {
 ![](img/7.png)
 
 ## 3.2 网络层 (raft-http)
-## 3.3 wal 
-## 3.4 snap
-## 3.5 存储层 (MVCC)
-## 3.6 持久层（boltdb）
-## 3.7 租约（leasor）
-## 3.8 监听（watcher）
-## 3.9 服务端（etcd server）
-## 3.10 客户端 （etcd client）
+### 3.2.1 etcd 集群之间网络传输的主要场景
+* leader 向 follower 传递心跳包，follower 向 leader回复消息
+* leader 向 follower 发送追加日志
+* leader 向 follower 发送 snapshot 数据
+* candidate 发起选举
+* follower 收到写操作转发给 leader
+
+### 3.2.2 etcd 网络拓扑
+![](../源码分析/img/13.png)
+* 每一个节点都会创建到其他各个节点之间的长链接。
+* 每个节点会向其他节点广播自己监听的端口，该端口只接受来自其他节点请求
+
+## 3.2.3 etcd 数据通道
+* 所有的消息类型传输都通过 PB 封装。
+* 数据大小不尽相同。 如 SNAPSHOT 数据，甚至超过1GB, 心跳消息只有几十个字节。
+* 2 种类型消息传输通道：Stream、Pipeline，使用HTTP协议传输数据。
+
+```go
+func (p *pipeline) post(data []byte) (err error) {
+    u := p.picker.pick()
+    // pb 格式序列化
+	req := createPostRequest(u, RaftPrefix, bytes.NewBuffer(data), "application/protobuf", p.tr.URLs, p.tr.ID, p.tr.ClusterID)
+ 
+    ... 
+    // 发送 post 请求
+	resp, err := p.tr.pipelineRt.RoundTrip(req)
+
+	return nil
+}
+```
+
+集群启动开始，就创建了这两种传输通道：
+* Stream：点到点之间维护HTTP长链接，主要用于传输数据量较小的消息，例如追加日志，心跳等；
+* Pipeline：点到点之间不维护HTTP长链接，短链接传输数据，用完即关闭。用于传输数据量大的消息，例如snapshot数据。
+* 都是基于 go http 实现的
+
+### 3.2.4 Stream类型通道
+1. Stream类型通道处理数据量少的消息，例如心跳，日志追加消息。点到点之间只维护1个HTTP长链接，交替向链接中写入数据，读取数据。
+
+2. 每一个Stream类型通道关联2个Goroutines, 其中一个用于建立HTTP链接，并从链接上读取数据, decode成message, 通过Channel传给Raft模块中，另外一个通过Channel 从Raft模块中收取消息，然后写入通道。
+
+
+### 3.2.5 Pipeline类型通道
+1. Pipeline类型通道处理数量大消息，例如SNAPSHOT消息。这种类型消息需要和心跳等消息分开处理，否则会阻塞心跳。
+2. Pipeline类型通道也可以传输小数据量的消息，当且仅当Stream类型链接不可用时。
+
+## 3.3 wal
+etcdserver 将 put 提案消息广播给集群各个节点，同时需要把集群 Leader 任期号、投票信息、已提交索引、提案内容持久化到一个 WAL（Write Ahead Log）日志文件中，用于保证集群的一致性、可恢复性
+
+## 3.3.1 日志结构
+![](../源码分析/img/20.png)
+
+```go
+type Record struct {
+    // 类型
+    Type             int64  `protobuf:"varint,1,opt,name=type" json:"type"`
+    // 校验码
+    Crc              uint32 `protobuf:"varint,2,opt,name=crc" json:"crc"`
+    // 日志数据，根据类型不同，内容也不同
+    Data             []byte `protobuf:"bytes,3,opt,name=data" json:"data,omitempty"`
+}
+```
+类型
+```go
+const (
+    // 元数据类型。每个wal文件的开头都记录了一条元数据, 节点 ID、集群 ID 信息
+    metadataType int64 = iota + 1
+    // entry 记录，客户端发送给服务端的数据
+    entryType
+    // 集群状态， hardstate, 批量写入entrytype类型的日志之前，都会先记录一条 statetype日志
+    stateType
+    // 用于校验
+    crcType
+    // 快照的数据相关信息, 快照记录包含快照的任期号、日志索引信息，用于检查快照文件的准确性，只记录索引，不记录数据
+    /*
+    type Snapshot struct {
+	Index            uint64 `protobuf:"varint,1,opt,name=index" json:"index"`
+	Term             uint64 `protobuf:"varint,2,opt,name=term" json:"term"`
+     }
+	*/
+    snapshotType
+)
+```
+### 3.3.2 文件管理
+![](../源码分析/img/17.png)
+
+* 要么是只读（节点恢复）、要么只能追加写
+* 格式为"序号--raft日志索引.wal
+* 日志大小 SegmentSizeBytes，默认64M，超限后会切割，提前创建以.tmp结尾的临时文件备用
+* 调用 fsync 持久化，一半持久化之后被认为已提交
+
+### 3.3.3 snap
+![](../源码分析/img/21.png)
+todo 与 boltdb 的关系
+
+* 做过快照之后的wal 可以删除（日志回放）
+
+## 3.4 存储层 (MVCC)
+## 3.5 持久层（boltdb）
+## 3.6 租约（leasor）
+## 3.7 监听（watcher）
+## 3.8 服务端（etcd server）
+todo
+
+## 3.8 客户端 （etcd client）
+todo
+
+## 3.10 实际问题
 
 
