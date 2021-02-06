@@ -1081,7 +1081,7 @@ type generation struct {
 ### 3.4.3 更新 key
 ![](img/16.png)
 1. 从 treeindex 找到 keyindex，如果是第一次就直接创建 Revison
-2. 通过 batchTx 接口将keyvalue 写到 boltdb 缓存和 buffer中
+2. 通过 batchTx 接口将keyvalue 写到 boltdb 缓存（所管理的内存数据结构中）和 buket buffer中
 ```go
 type KeyValue struct {
 	// key is the key in bytes. An empty key is not allowed.
@@ -1103,7 +1103,7 @@ type KeyValue struct {
 }
 ```
 3. 更新回 treeindex
-4. **此时还未持久化**, etcd 一般情况下堆积的写事务数大于 1 万才在写事务结束时同步持久化，另外回启动单独协程定时将 boltdb 缓存中的脏数据提交到持久化存储磁盘
+4. **此时还未持久化**, 因为事务提交代价高（B+tree 的平衡、分裂，将 boltdb 的脏数据（dirty page）、元数据信息刷新到磁盘），etcd 一般情况下堆积的写事务数大于 1 万才在写事务结束时同步持久化，另外会启动单独协程定时将 boltdb 缓存中的脏数据提交到持久化存储磁盘
 ```
 	// BackendBatchInterval is the maximum time before commit the backend transaction.
 	BackendBatchInterval time.Duration
@@ -1188,6 +1188,14 @@ func (bb *bucketBuffer) Range(key, endKey []byte, limit int64) (keys [][]byte, v
 	return keys, vals
 }
 ```
+
+### 3.4.7 读写并发情况
+大量读是否会影响写？
+0. 线性读（readindex）不在持久化wal，不走一遍 raft，降低对写的影响
+1. boltdb 事务采用读写锁，可以多个读或者1个写
+2. 读事务 全量拷贝 bucket buffer，读和写事务分开
+
+所以大量度对写的影响
 
 ## 3.5 持久层（boltdb）
 todo
