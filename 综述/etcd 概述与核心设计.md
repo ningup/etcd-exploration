@@ -962,12 +962,236 @@ const (
 
 ### 3.3.3 snap
 ![](../源码分析/img/21.png)
-todo 与 boltdb 的关系
 
 * 做过快照之后的wal 可以删除（日志回放）
 
 ## 3.4 存储层 (MVCC)
+![](img/12.png)
+```shell
+# 更新key hello为world1
+$ etcdctl put hello world1
+OK
+# 通过指定输出模式为json,查看key hello更新后的详细信息
+$ etcdctl get hello -w=json
+{
+    "kvs":[
+        {
+            "key":"aGVsbG8=",
+            "create_revision":2,
+            "mod_revision":2,
+            "version":1,
+            "value":"d29ybGQx"
+        }
+    ],
+    "count":1
+}
+# 再次修改key hello为world2
+$ etcdctl put hello world2
+OK
+# 确认修改成功,最新值为wolrd2
+$ etcdctl get hello
+hello
+world2
+# 指定查询版本号,获得了hello上一次修改的值
+$ etcdctl get hello --rev=2
+hello
+world1
+# 删除key hello
+$ etcdctl del  hello
+1
+# 删除后指定查询版本号3,获得了hello删除前的值
+$ etcdctl get hello --rev=3
+hello
+world2
+```
+
+### 3.4.1 整体架构
+![](img/13.png)
+* ReadTx 定义了抽象的读事务接口
+* BatchTx 在 ReadTx 之上定义了抽象的写事务接口
+* Buffer 是数据缓存区。
+
+boltdb 存储格式
+![](img/15.jpg)
+
+
+### 3.4.2 TreeIndex
+treeIndex 模块基于内存版的 B-tree 实现了 key 索引管理，它保存了用户 key 与版本号（revision）的映射关系等信息。
+
+```go
+// 实现的接口
+type index interface {
+	Get(key []byte, atRev int64) (rev, created revision, ver int64, err error)
+	Range(key, end []byte, atRev int64) ([][]byte, []revision)
+	Revisions(key, end []byte, atRev int64) []revision
+	Put(key []byte, rev revision)
+	Tombstone(key []byte, rev revision) error
+	RangeSince(key, end []byte, rev int64) []revision
+	Compact(rev int64) map[revision]struct{}
+	Keep(rev int64) map[revision]struct{}
+	Equal(b index) bool
+
+	Insert(ki *keyIndex)
+	KeyIndex(ki *keyIndex) *keyIndex
+}
+
+type treeIndex struct {
+	sync.RWMutex
+	tree *btree.BTree
+	lg   *zap.Logger
+}
+```
+
+b-tree 结构
+* 索引：用户原始 key 值
+* value： KeyIndex
+
+**为什么使用 b-tree？而不是 hashmap 或者平衡二叉树**
+1. etcd 支持范围查询，哈希表不合适
+2. 为了减少查询次数使用 b tree，而不是平衡二叉树
+3. etcd 使用 b 树的度数是 32，即每个节点最多有 64 个key
+```go
+func newTreeIndex(lg *zap.Logger) index {
+	return &treeIndex{
+		tree: btree.New(32),
+		lg:   lg,
+	}
+}
+```
+
+
+#### KeyIndex
+```go
+type keyIndex struct { 
+    key []byte //用户的key名称
+    modified revision //最后一次修改key时的etcd revision
+    generations []generation //generation保存了一个key若干代版本号信息，每代中包含对key的多次修改的版本号列表
+}
+
+
+type generation struct {
+   ver     int64    //表示此key的修改次数
+   created revision //表示generation结构创建时的版本号
+   revs    []revision //每次修改key时的revision追加到此数组
+}
+```
+
+![](img/14.png)
+
+### 3.4.3 更新 key
+![](img/16.png)
+1. 从 treeindex 找到 keyindex，如果是第一次就直接创建 Revison
+2. 通过 batchTx 接口将keyvalue 写到 boltdb 缓存和 buffer中
+```go
+type KeyValue struct {
+	// key is the key in bytes. An empty key is not allowed.
+	Key []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// create_revision is the revision of last creation on this key.
+	CreateRevision int64 `protobuf:"varint,2,opt,name=create_revision,json=createRevision,proto3" json:"create_revision,omitempty"`
+	// mod_revision is the revision of last modification on this key.
+	ModRevision int64 `protobuf:"varint,3,opt,name=mod_revision,json=modRevision,proto3" json:"mod_revision,omitempty"`
+	// version is the version of the key. A deletion resets
+	// the version to zero and any modification of the key
+	// increases its version.
+	Version int64 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
+	// value is the value held by the key, in bytes.
+	Value []byte `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
+	// lease is the ID of the lease that attached to key.
+	// When the attached lease expires, the key will be deleted.
+	// If lease is 0, then no lease is attached to the key.
+	Lease int64 `protobuf:"varint,6,opt,name=lease,proto3" json:"lease,omitempty"`
+}
+```
+3. 更新回 treeindex
+4. **此时还未持久化**, etcd 一般情况下堆积的写事务数大于 1 万才在写事务结束时同步持久化，另外回启动单独协程定时将 boltdb 缓存中的脏数据提交到持久化存储磁盘
+```
+	// BackendBatchInterval is the maximum time before commit the backend transaction.
+	BackendBatchInterval time.Duration
+
+    defaultBatchInterval = 100 * time.Millisecond
+```
+```go
+func (b *backend) run() {
+	defer close(b.donec)
+	t := time.NewTimer(b.batchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-b.stopc:
+			b.batchTx.CommitAndStop()
+			return
+		}
+		if b.batchTx.safePending() != 0 {
+			b.batchTx.Commit()
+		}
+		t.Reset(b.batchInterval)
+	}
+}
+```
+
+### 3.4.4 查询 key
+1. 从 treeindex 拿到 keyindex，从 generation中找到最新的版本
+2. 调用并发读接口 ConcurrentReadTx （全量拷贝当前写事务未提交的 buffer 数据，并发的读写事务不再阻塞读）优先从 buffer 查，未命中从boltdb查
+
+### 3.4.5 删除 key（延期删除模式）
+1. boltdb key 版本号{4,0,t} 增加 t 标识
+2. treeindex 追加空的 generation
+```go
+key:     "hello"
+modified: <4,0>
+generations:
+[
+{ver:3,created:<2,0>,revisions: [<2,0>,<3,0>,<4,0>(t)]}，             
+{empty}
+]
+```
+
+* 可以watch 历史删除事件
+
+### 3.4.6 bufer 缓存
+```go
+// bucketBuffer buffers key-value pairs that are pending commit.
+type bucketBuffer struct {
+	buf []kv
+	// used tracks number of elements in use so buf can be reused without reallocation.
+	used int
+}
+```
+* 缓存更新，会做一次排序
+* 查找的时候用 二分，方便范围查找 key - endKey
+```go
+func (bb *bucketBuffer) Range(key, endKey []byte, limit int64) (keys [][]byte, vals [][]byte) {
+	f := func(i int) bool { return bytes.Compare(bb.buf[i].key, key) >= 0 }
+	// 二分查找
+	idx := sort.Search(bb.used, f)
+	if idx < 0 {
+		return nil, nil
+	}
+	if len(endKey) == 0 {
+		if bytes.Equal(key, bb.buf[idx].key) {
+			keys = append(keys, bb.buf[idx].key)
+			vals = append(vals, bb.buf[idx].val)
+		}
+		return keys, vals
+	}
+	if bytes.Compare(endKey, bb.buf[idx].key) <= 0 {
+		return nil, nil
+	}
+	for i := idx; i < bb.used && int64(len(keys)) < limit; i++ {
+		if bytes.Compare(endKey, bb.buf[i].key) <= 0 {
+			break
+		}
+		keys = append(keys, bb.buf[i].key)
+		vals = append(vals, bb.buf[i].val)
+	}
+	return keys, vals
+}
+```
+
 ## 3.5 持久层（boltdb）
+todo
+
 ## 3.6 租约（leasor）
 ## 3.7 监听（watcher）
 ## 3.8 服务端（etcd server）
@@ -977,5 +1201,9 @@ todo
 todo
 
 ## 3.10 实际问题
+### 一致性读
 
+## 值得学习的设计
+* go http包: Transoport 维护的tcp连接池
+* boltdb: 非常简单的存储设计
 
