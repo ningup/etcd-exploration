@@ -1201,6 +1201,110 @@ func (bb *bucketBuffer) Range(key, endKey []byte, limit int64) (keys [][]byte, v
 todo
 
 ## 3.6 租约（leasor）
+* 用于实现key定时删除功能
+* 检测客户端是否存活
+
+### 3.6.1 使用租约
+```go
+func testLease() {
+    le := newLessor()    // 创建一个lessor
+    le.Promote(0)        // 将lessor设置为Primary，这个与raft会出现网络分区有关，不了解可以忽略
+    
+    go func() {          // 开启一个协程，接收过期的key，主动删除
+        for {  
+           expireLease := <-le.ExpiredLeasesC()  
+
+           for _, v := range expireLease {  
+              le.Revoke(v.ID)    // 通过租约ID删除租约，删除租约时会从backend中删除绑定的key
+           }  
+        }
+    }()
+    
+    ttl = 5                      // 过期时间设置5s
+    lease := le.Grant(id, ttl)   // 申请一个租约
+    
+    le.Attach(lease, "foo")      // 将租约绑定在"foo"上
+    
+    time.Sleep(10 * time.Second) // 阻塞10s，方便看到结果
+}
+```
+### 3.6.2 总体架构
+![](../源码分析/img/31.png)
+
+Leader 维护
+* LeaseMap map[LeaseID]*Lease  --  用于根据LeaseID快速找到*Lease
+* ItemMap map[LeaseItem]LeaseID -- 用于根据LeaseItem快速找到LeaseID，从而找到*Lease
+* LeaseExpiredNotifier 是对 LeaseQueue 的一层封装， 快速找到即将过期的租约 (堆实现)
+
+
+性能分析：
+1. 不同 key 若 TTL 相同，可复用同一个 Lease， 显著减少了 Lease 数。
+2. 通过 gRPC HTTP/2 实现了多路复用，流式传输，同一连接可支持为多个 Lease 续期，大大减少连接数。
+
+### 3.6.3 实现
+etcd Lessor 主循环每隔 500ms 执行一次撤销 Lease 检查（RevokeExpiredLease），若已过期则加入到待淘汰列表，直到堆顶的 Lease 过期时间大于当前，则结束本轮轮询。
+```go
+func (le *lessor) runLoop() {
+	defer close(le.doneC)
+    // 一直循环处理
+	for {
+        // 从优先队列头依次查找是否有过期，有的话放入通道
+		le.revokeExpiredLeases()
+		le.checkpointScheduledLeases()
+
+        // 阻塞 500ms，进行下一步检测
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-le.stopC:
+			return
+		}
+	}
+}
+
+func (le *lessor) revokeExpiredLeases() {
+	var ls []*Lease
+
+	// rate limit
+	revokeLimit := leaseRevokeRate / 2
+
+	le.mu.RLock()
+	if le.isPrimary() {
+		// 查找当前的过期租约
+		ls = le.findExpiredLeases(revokeLimit)
+	}
+	le.mu.RUnlock()
+
+	if len(ls) != 0 {
+		select {
+		case <-le.stopC:
+			return
+        // 过期租约写入通道
+		case le.expiredC <- ls:
+		default:
+		    // 如果通道阻塞，则下次处理
+		}
+	}
+}
+```
+### 3.6.4 revoke
+1. 过期的lease 会发送到 expiredC
+2. etcd server 收到过期lease，发送 lease revoke 请求, 通过 Raft Log 传递给 Follower 节点。
+```go
+func (s *EtcdServer) LeaseRevoke(ctx context.Context, r *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error) {
+	resp, err := s.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseRevoke: r})
+	if err != nil {
+		return nil, err
+	}
+	return resp.(*pb.LeaseRevokeResponse), nil
+}
+```
+3. Follower 收到消息后获取 lease 关联的 key 列表
+    * 从 boltdb 中删除 key
+	* 从 Lessor 的 Lease map 内存中删除此 Lease 对象
+	* boltdb 的 Lease bucket 中删除这个 Lease。
+
+### 3.6.5 存储 
+![](img/20.png)
 
 ## 3.7 监听（watcher）
 快速获取数据变更通知，而不是使用消耗可能大的轮询模式。
@@ -1212,7 +1316,7 @@ todo
 ```go
 type Event struct {
     // 更新或者删除
-	Type Event_EventType `protobuf:"varint,1,opt,name=type,proto3,enum=mvccpb.Event_EventType" json:"type,omitempty"`
+	Type Event_EventType `protobuf:"varint,1,opt,name=type,proto3,enum=mvccpb.EvGent_EventType" json:"type,omitempty"`
     //发生事件之后的数据
 	Kv *KeyValue `protobuf:"bytes,2,opt,name=kv" json:"kv,omitempty"`
     // 发生事件之前的数据
@@ -1220,10 +1324,8 @@ type Event struct {
 }
 ```
 
-
-
 ### 3.7.2 连接复用
-* http2  多路复用、乱序发送
+* http2  多路复用、数据帧乱序发送
 * 一个 client/TCP 连接支持多 gRPC Stream， 一个 gRPC Stream 又支持多个 watcher
 ![](img/19.png)
 
@@ -1309,15 +1411,20 @@ type watcherGroup struct {
 ```
 
 ## 3.8 服务端（etcd server）
-todo
+**todo**
 
 ## 3.8 客户端 （etcd client）
-todo
+**todo**
+
+## 3.9 维护（Maintenance）
+**todo**
 
 ## 3.10 实际问题
-### 一致性读
+### 一致性读(线性读)
+### 租约时间不准可能的原因
+### watch 历史事件可能丢吗
 
-## 值得学习的设计
+## 3.11 值得学习的设计
 * go http包: Transoport 维护的tcp连接池
 * boltdb: 非常简单的存储设计
 * watch 的设计： 考虑大量事件的缓冲
