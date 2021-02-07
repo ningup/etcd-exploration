@@ -877,7 +877,7 @@ func (rc *raftNode) serveChannels() {
 * follower 收到写操作转发给 leader
 
 ### 3.2.2 etcd 网络拓扑
-![](../源码分析/img/13.png)
+![](img/21.png)
 * 每一个节点都会创建到其他各个节点之间的长链接。
 * 每个节点会向其他节点广播自己监听的端口，该端口只接受来自其他节点请求
 
