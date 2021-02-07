@@ -31,12 +31,30 @@
     * etcd 是 官方维护
 	* zk 通常使用 Curator。Curator是 Netflix 公司开源的一个Zookeeper客户端，Curator框架在zookeeper 原生 API 接口上进行了包装，解决了很多 ZooKeeper 客户端非常底层的细节开发
 
-## 1.4 版本控制 (MVCC)
+## 1.4 基本功能
+https://etcd.io/docs/v3.4.0/demo/
+* get/put
+* compact
+* txn
+* watch
+* lease
+* status
+
+```shell
+[DEV (v.v) sa_cluster@test1 ~]$ /sensorsdata/main/program/armada/etcd/bin/etcdctl endpoint status -w="table"  --endpoints=test1.sa:2379
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+|   ENDPOINT    |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+| test1.sa:2379 | 685785ec03d61bfd |  3.4.13 |   20 kB |      true |      false |         2 |          8 |                  8 |        |
++---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+```
+
+## 1.5 版本控制 (MVCC)
 * 写操作都会创建新的版本
 * 读操作会从有限的多个版本中挑选一个最合适的（要么是最新版本，要么是指定版本)
 * 无需关心读写之间的冲突
 
-### 1.4.1 版本描述
+### 1.5.1 版本描述
 从 etcd 中描述 key value 可以看到：
 ```go
 type KeyValue struct {
@@ -57,19 +75,18 @@ type KeyValue struct {
 }
 ```
 
-### 1.4.2 逻辑时钟 (revision)
+### 1.5.2 逻辑时钟 (revision)
 * int64 全局递增
 * 可以视为全局的逻辑时钟，任何键空间发生变化，revision 都会增加；指定 revision 操作时，理解为时钟回退到那个时刻
 * 用事务封装的操作，revision 在后台只会更改一次
 * revision值大的键值对一定是在revision值小键值对之后修改的
 
-## 1.5 etcd API
+## 1.6 etcd API
 * https://github.com/etcd-io/etcd/blob/release-3.4/etcdserver/etcdserverpb/rpc.proto
 * https://godoc.org/github.com/coreos/etcd/clientv3
 
-### 1.5.1 核心 API
-#### 1.5.1.1 KV
-(range, 线性读/串行读)
+### 1.6.1 核心 API
+* **KV** （range, 线性读/串行读）
 ```go
 service KV {
   // 从键值存储中获取范围内的key.
@@ -91,8 +108,7 @@ service KV {
 }
 ```
 
-#### 1.5.1.2 Watch
-(复用连接、watch 范围/历史)
+* **Watch** (复用连接、可 watch 范围/历史)
 ```go
 service Watch {
   // Watch watches for events happening or that have happened. Both input and output
@@ -108,8 +124,7 @@ service Watch {
 }
 ```
 
-#### 1.5.1.3 Lease
-(有最小TTL/集群时钟不一致时ttl不准)
+* **Lease** (有最小TTL)
 ```go
 service Lease {
   // LeaseGrant 创建一个租约，当服务器在给定 time to live 时间内没有接收到 keepAlive 时租约过期。
@@ -135,19 +150,19 @@ clientV3：
     * 如果 stream 失效， 500ms重试
 * KeepAliveOnce 续租一次
 
-#### 1.5.1.4 Cluster
+**Cluster**
 集群管理相关 add/remove/update member/learner
 
-
-#### 1.5.1.5 Maintenance
+**Maintenance**
 维护相关操作(报警/后端碎片整理)
 
-#### 1.5.1.6 Auth
+**Auth**
 用户鉴权管理相关
 
 ### 1.5.2 并发 API
 [并发 API 官方文档](https://github.com/etcd-io/etcd/blob/master/Documentation/dev-guide/api_concurrency_reference_v3.md)
-#### 1.5.2.1 Lock 分布式锁
+
+* **Lock 分布式锁**
 ```go
 type LockServer interface {
 	// Lock acquires a distributed shared lock on a given named lock.
@@ -201,7 +216,7 @@ func (m *Mutex) Lock(ctx context.Context) error {
 * unlock: 把 myKey 删掉就行了
 
 
-#### 1.5.2.2 Election 选举
+* **Election 选举**
 ```go
 type ElectionServer interface {
 	// Campaign waits to acquire leadership in an election, returning a LeaderKey
@@ -275,7 +290,7 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 }
 ```
 
-## 1.6 etcd 主要应用场景
+## 1.7 etcd 主要应用场景
 
 * 服务发现 (租约，心跳保持 )
 * 消息发布与订阅 (Watch)
@@ -284,56 +299,53 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 * 分布式锁 (最小的 create_revision)
 * 选举（分布式锁）
 
-## 1.7 高可用
+## 1.8 高可用
 半数以上投票可选主（单节点特殊选主流程，直接为主）
 | 节点个数 | 高可用情况                                                                    |
 | -------- | ---------------------------------------------------------------------------------- |
-| 1        | 没有高可用，可以选主                                                     |
+| 1        | 没有高可用，可以选主（走的特殊 raft 逻辑）                                             |
 | 2        | 没有高可用，能选主，如果挂掉一台，不能选主，活着的节点可以读（非一致性读），不能写 |
 | 3        | 允许挂1个                                                                      |
 | 4        | 允许挂1个                                                                      |
 | 5        | 允许挂2个                                                                      |
 | 6        | 允许挂2个                                                                      ||
 
-## 1.8 Demo
-https://etcd.io/docs/v3.4.0/demo/
-* get/put
-* compact
-* txn
-* watch
-* lease
-* status
-
-```shell
-[DEV (v.v) sa_cluster@test1 ~]$ /sensorsdata/main/program/armada/etcd/bin/etcdctl endpoint status -w="table"  --endpoints=test1.sa:2379
-+---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
-|   ENDPOINT    |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |
-+---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
-| test1.sa:2379 | 685785ec03d61bfd |  3.4.13 |   20 kB |      true |      false |         2 |          8 |                  8 |        |
-+---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
-```
 
 # 2 总体架构
 ![](img/10.png)
+* Client 层：API 客户端库， 支持负载均衡、节点间故障自动转移
+* API 网络层：
+    * client 访问 server，使用 grpc（通过 grpc-gateway 也支持 HTTP/1.x）
+	* server 节点之间的通信协议，使用的 HTTP 协议。
+* Raft 层：数据一致性的保证，我觉得是 etcd 最重要的模块
+* 功能层：etcd 核心功能实现层
+* 存储层：存储层包含预写日志 (WAL) 模块、快照 (Snapshot) 模块、boltdb 模块。
 
-# 3 内部机制解析
+# 3 模块原理拆解
 ## 3.1 共识层（etcd-raft/node）
 ### 3.1.1 状态机复制
 ![](../基础知识/img/2.png)
 
 * 解决问题：分布式高可用，多副本。
 * 基本假设：如果状态机拥有相同的初始状态，接收到相同的命令，处理这些命令的顺序也相同，那么最终状态就会相同。
+* Leader 拥有绝对权利
 
 ### 3.1.2 选举流程（状态切换）
 ![](img/2.png)
+```go
+// 两个计时器的超时时间
+heartbeatTimeout int
+electionTimeout  int
+```
 
 注意点
 * Follower 拒绝投票给日志没有自己新的 candidate，保证能够成为 Leader 的 candidate 一定包含最新的日志
 * Learner： 新加入集群节点，不参与抢主，防止长时间同步日志， Leader直接向其发送快照
 * PreVote：防止网络分区，不够半数以上的分区无限发起选举，因此必须能够和半数以上的节点连接成功的节点才能成为 candidate
 
-#### becomeFollower()
-主要工作是设置 raft 各类变量
+**时钟计时器**：raft内部计时器，推进时间向前，逻辑概念，不是真实时钟
+
+* becomeFollower()，主要工作是设置 raft 各类变量
 ```go
 func (r *raft) becomeFollower(term uint64, lead uint64) {
 	// 处理消息的函数指针
@@ -350,61 +362,20 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 ```go
 func (r *raft) tickElection() {
 	r.electionElapsed++
-    // 超时
+	// 超时
 	if r.promotable() && r.pastElectionTimeout() {
 		r.electionElapsed = 0
-		// 触发选举，后边会介绍各类消息处理流程
+		// 触发选举(MsgHup)
 		r.Step(pb.Message{From: r.id, Type: pb.MsgHup})
 	}
 }
 ```
 
-#### becomeCandidate()
+* becomeCandidate()
 当 follower 连接数大于一半时调用 becomeCandidate() 成为候选
-```go
-func (r *raft) becomeCandidate() {
-	// TODO(xiangli) remove the panic when the raft implementation is stable
-	if r.state == StateLeader {
-		panic("invalid transition [leader -> candidate]")
-	}
-	r.step = stepCandidate
-	r.reset(r.Term + 1)
-	r.tick = r.tickElection
-	r.Vote = r.id
-	r.state = StateCandidate
-	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
-}
-```
 
-#### becomeLeader()
+* becomeLeader()
 当 candidate 投票超过半数，则调用 becomeLeader 
-```go
-func (r *raft) becomeLeader() {
-	// TODO(xiangli) remove the panic when the raft implementation is stable
-	if r.state == StateFollower {
-		panic("invalid transition [follower -> leader]")
-	}
-	r.step = stepLeader
-	r.reset(r.Term)
-	r.tick = r.tickHeartbeat
-	r.lead = r.id
-	r.state = StateLeader
-
-	r.prs.Progress[r.id].BecomeReplicate()
-
-	r.pendingConfIndex = r.raftLog.lastIndex()
-
-	emptyEnt := pb.Entry{Data: nil}
-	// 向当前节点追加一条空entry记录
-	// 当一个节点成为 Leader 后会立即提交一条空日志，将自身携带的所有日志都设置为提交状态，该日志条目之前的所有日志条目也都会被提交，包括由其它 Leader 创建但还没有提交的日志条目，然后向集群内的其它节点同步。
-	if !r.appendEntry(emptyEnt) {
-		// This won't happen because we just called reset() above.
-		r.logger.Panic("empty entry was dropped")
-	}
-
-	r.reduceUncommittedSize([]pb.Entry{emptyEnt})
-	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
-```
 
 ### 3.1.3 日志
 Entry: 每一个操作项, raft 的核心能力就是为应用层提供序列相同的 Entry
@@ -506,23 +477,14 @@ const (
 	MsgPreVoteResp    MessageType = 18
 )
 ```
-#### MsgHup
+* MsgHup
 Follower 的选举计时器超时会创建 MsgHup 消息并调用 raft.Step()方法处理，该方法是各类消息处理的入口
 ```go
 func (r *raft) Step(m pb.Message) error {
 	switch m.Type {
 	case pb.MsgHup:
-	    // 非leader 才会处理
+		// 非leader 才会处理
 		if r.state != StateLeader {
-            // 获取提交但是慰应用的 entry
-			ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
-            // 检测是否有 confchange，有的话放弃选举 
-			if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
-				r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
-				return nil
-			}
-
-			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 			// 调用 campaign 进行角色切换
 			if r.preVote {
 				r.campaign(campaignPreElection)
@@ -536,7 +498,7 @@ func (r *raft) Step(m pb.Message) error {
 	return nil
 }
 ```
-campaign 除了完成状态切换，也会向其他节点发起同类消息
+campaign 除了完成状态切换，也会向其他节点发起同类消息(只**保存到 raft.msg 里，不真的发送**)
 ```go
 func (r *raft) campaign(t CampaignType) {
 	// 方法最后会发送一条消息
@@ -575,58 +537,18 @@ func (r *raft) campaign(t CampaignType) {
 		if t == campaignTransfer {
 			ctx = []byte(t)
 		}
-		// 想其他节点发送消息，主要只是追加到 raft.msg 里, 待上层应用发送
+		// 向其他节点发送消息，主要只是追加到 raft.msg 里, 待上层应用发送
 		r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
 	}
 }
 ```
 
-#### MsgAPP
-Follower 收到 msgapp 消息后会调用 handleAppendEntries 把日志追加到自己的 raftLog 里
-```go
-func (r *raft) handleAppendEntries(m pb.Message) {
-	// 如果 index 已经提交了就不追加了
-	if m.Index < r.raftLog.committed {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
-		return
-	}
-
-    // 追加到 raftLog 里
-	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
-	} else {
-		r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
-			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})
-	}
-}
-```
-
-#### MsgProc
-客户端的写请求通过 MsgProc 发送给 Leader，响应该消息的方法是 stepLeader()
-```go
-func stepLeader(r *raft, m pb.Message) error {
-	// These message types do not require any progress for m.From.
-	switch m.Type {
-	case pb.MsgProp:
-        // 将上述消息 append 到 raftlog 里
-		if !r.appendEntry(m.Entries...) {
-			return ErrProposalDropped
-		}
-		// 通过 MsgApp 消息向Follower节点复制
-		r.bcastAppend()
-		return nil
-	}
-}
-```
-
-### 3.1.5 总结
+### 3.1.5 raft 总结
 raft 本身没有实现网络层，持久化，这些都交给了上层应用来做
 * 消息发送只是缓存在  ```msgs []pb.Message```, 上层来发送
 * Entry 持久化缓存在 raftLog 里， 上层应用来持久化本地以及 把 unstable 写入到 Storage
 
-### 3.1.6 集群中的节点 Node
-* 它是 raft 对上层应用的一层封装
+### 3.1.6 对raft的一层抽象 Node
 * 衔接应用层和 Raft 模块的消息传输，将应用层的消息传递给 Raft 模块，并将 raft 模块处理后的结果反馈给应用层
 
 ```go
@@ -645,43 +567,26 @@ type node struct {
 	rn *RawNode
 }
 ```
-用于处理 node 对象的各类通道，一个后台go协程
+node 与上层应用以及下层 raft 的通信的主流程：
 ```go
 func (n *node) run() {
-	var propc chan msgWithResult
-	var readyc chan Ready
-	var advancec chan struct{}
-	var rd Ready
-
-	r := n.rn.raft
-
-	lead := None
-
 	for {
 		// 上层模块还没有处理完，因此不需要往 ready 通道写入数据
 		if advancec != nil {
 			readyc = nil
 
 		} else if n.rn.HasReady() {
-            // 构造 ready
+			// 构造 ready
 			rd = n.rn.readyWithoutAccept()
 			readyc = n.readyc
 		}
 
 		select {
-        // 读取 propc 通道，获取 MsgPropc 消息，交给 raft.step() 处理
+		// 读取 propc 通道，获取 MsgPropc 消息，交给 raft.step() 处理
 		case pm := <-propc:
 			m := pm.m
 			m.From = r.id
 			err := r.Step(m)
-        // 读取 recvc通道，获取非 MsgPropc 消息类型，交给 raft.step()  处理
-		case m := <-n.recvc:
-			// filter out response message from unknown From.
-			if pr := r.prs.Progress[m.From]; pr != nil || !IsResponseMsg(m.Type) {
-				r.Step(m)
-			}
-        // 读取 ConfChange 实例 进行处理
-		case cc := <-n.confc:
 		   ...
         // 逻辑时钟推进一次，调用 raft.tick() 进行时钟推进
 		case <-n.tickc:
@@ -695,10 +600,6 @@ func (n *node) run() {
 			n.rn.Advance(rd)
 			rd = Ready{}
 			advancec = nil
-		case c := <-n.status:
-			c <- getStatus(r)
-		case <-n.stop:
-			close(n.done)
 			return
 		}
 	}
@@ -707,166 +608,36 @@ func (n *node) run() {
 
 raft 使用 Ready 对外传递数据，上层引用处理完一个后调用 Advance(), 通知 raft 产生下一个 ready
 ```go
+// 主要字段如下:
 type Ready struct {
-	// The current volatile state of a Node.
-	// SoftState will be nil if there is no update.
-	// It is not required to consume or store SoftState.
-	*SoftState
-
-	// The current state of a Node to be saved to stable storage BEFORE
-	// Messages are sent.
-	// HardState will be equal to empty state if there is no update.
-	pb.HardState
-
-	// ReadStates can be used for node to serve linearizable read requests locally
-	// when its applied index is greater than the index in ReadState.
-	// Note that the readState will be returned when raft receives msgReadIndex.
-	// The returned is only valid for the request that requested to read.
-	ReadStates []ReadState
-
-	// Entries specifies entries to be saved to stable storage BEFORE
-	// Messages are sent.
 	// Entries保存的是从unstable读取的Entry，它们即将被应用层写入storage
 	Entries []pb.Entry
-
 	// Snapshot specifies the snapshot to be saved to stable storage.
 	Snapshot pb.Snapshot
-
-	// CommittedEntries specifies entries to be committed to a
-	// store/state-machine. These have previously been committed to stable
-	// store.
 	// 已经被 Committed，还没有applied，应用层会把他们应用到状态机。
 	CommittedEntries []pb.Entry
-
-	// Messages specifies outbound messages to be sent AFTER Entries are
-	// committed to stable storage.
-	// If it contains a MsgSnap message, the application MUST report back to raft
-	// when the snapshot has been received or has failed by calling ReportSnapshot.
 	// 需要处理的消息
 	Messages []pb.Message
-
-	// MustSync indicates whether the HardState and Entries must be synchronously
-	// written to disk or if an asynchronous write is permissible.
-	MustSync bool
 }
 ```
 
 ### 3.1.7 工作流
-#### 主流程
 ![](img/3.png)
-1. 客户端向 etcd 集群发送一次写请求，请求中封装成 Entry 日志，交给 Raft 处理，Raft 模块先将 Entry 保存到 unstable 中
+1. 客户端发送写请求，请求封装成 Entry 日志给 Raft 处理，Raft 将 Entry 保存到 unstable
 2. Raft 模块将该 Entry 日志封装到 Ready 实例中，返回给上层模块进行持久化
-3. 上层应用收到待持久化的 Entry 日志之后，先将其写入 WAL 文件，然后向集群中的其它节点广播这一条数据
+3. 上层应用收到待持久化的 Entry 日志，其写入 WAL 文件，然后向集群中的其它节点广播这一条数据
 4. 上层应用通知 raft 模块将该 Entry 日志从 unstable 『移动』到 MemoryStorage；
-5. 该 Entry 日志被复制到集群半数以上的节点时，该 Entry 日志会被 Leader 节点确认为己提交，Leader 会回复客户端写请求操作成功，并将 Entry 日志再次封装进 Ready 实例返回给上层模块；
+5. Entry 日志被复制到集群半数以上的节点时，该 Entry 日志会被 Leader 节点确认为己提交，Leader 会回复客户端写请求操作成功，并将 Entry 日志再次封装进 Ready 实例返回给上层模块；
 6. 上层模块将该 Ready 实例中携带的待应用 Entry 日志应用到状态机中。
 7. 上层应用通知 raft 模块将该 Entry 日志应用到 storage 
 
-#### 数据流
-![](img/4.png)
-
-```go
-func (rc *raftNode) serveChannels() {
-    // 根据前边已经回放日志好的信息，读取快照信息
-	snap, err := rc.raftStorage.Snapshot()
-
-	rc.confState = snap.Metadata.ConfState
-	rc.snapshotIndex = snap.Metadata.Index
-	rc.appliedIndex = snap.Metadata.Index
-
-	defer rc.wal.Close()
-
-    // 创建一个定时器，每100ms触发一次，这个是 etcd-raft 最小的时间单位(逻辑时钟)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	// send proposals over raft
-	go func() {
-		confChangeCount := uint64(0)
-
-		for rc.proposeC != nil && rc.confChangeC != nil {
-			select {
-			case prop, ok := <-rc.proposeC:
-                // blocks until accepted by raft state machine
-                // 通过 raft 的 node 把客户端传过来的数据请求交给 etcd-raft
-                rc.node.Propose(context.TODO(), []byte(prop))
-
-            case cc, ok := <-rc.confChangeC:
-                // 统计集群变更请求的次数
-                confChangeCount++
-                cc.ID = confChangeCount
-                // 同理， 通过 raft 的 node 把客户端传过来集群变更请求交给 etcd-raft
-                rc.node.ProposeConfChange(context.TODO(), cc)
-			}
-		}
-		// client closed channel; shutdown raft if not already
-		close(rc.stopc)
-	}()
-
-    // event loop on raft state machine updates
-    // 下边的循环负责处理底层raft返回来的 ready 数据，
-	for {
-		select {
-        // 推进 raft 逻辑时钟
-		case <-ticker.C:
-			rc.node.Tick()
-
-		// store raft entries to wal, then publish over commit channel
-        case rd := <-rc.node.Ready():
-            /*
-                1. 将 底层 raft 传过来的状态信息，待持久化的 Entries 等记录到 wal 日志，即使宕机这些信息也可以再下次重启节点后回放日志
-            */
-            rc.wal.Save(rd.HardState, rd.Entries)
-            // 产生了新的快照
-			if !raft.IsEmptySnap(rd.Snapshot) {
-                // 保存快照
-                rc.saveSnap(rd.Snapshot)
-                // 新快照写到 Storage 里
-                rc.raftStorage.ApplySnapshot(rd.Snapshot)
-                // 通知上层应用加载新快照
-				rc.publishSnapshot(rd.Snapshot)
-            }
-            // 将待持久化的 Entries 持久化到 Storage 里
-            rc.raftStorage.Append(rd.Entries)
-            // 将待发送的消息发送到指定节点
-            rc.transport.Send(rd.Messages)
-            // 将已经提交待应用的 Entry 记录到上层应用的状态机里
-			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
-				rc.stop()
-				return
-            }
-            // 尝试触发快照
-            rc.maybeTriggerSnapshot()
-            // 处理完 Ready，通知底层 etcd-raft准备下一个 Ready 实例
-			rc.node.Advance()
-
-		case err := <-rc.transport.ErrorC:
-			rc.writeError(err)
-			return
-
-		case <-rc.stopc:
-			rc.stop()
-			return
-		}
-	}
-}
-```
-* 负责监听 proposeC 和 confChangeC 两个通道，将从通道传来的信息传给底层 raft 处理
-* 处理底层 raft 返回的 Ready 数据，包括了已经准备好读取、持久化、提交或者发送给 follower 的 entries 和 messages 等信息
-* 配置了一个定时器，定时器到期时调用节点的 Tick() 方法推动 raft 逻辑时钟前
-
-#### 客户端请求
 ![](img/5.png)
 
-#### 接收消息
-![](img/6.png)
-
-1. 从Network收到消息，可以是leader给follower的消息，也可以是follower发给leader的响应消息，Network的handler函数将数据回传给raftNode
-2. raftNode调用Step函数，将数据发给raft，数据被写入recvc通道
-3. raft的Step从recvc收到消息，并修改raftLog中的日志
-
-#### 应用日志
-![](img/7.png)
+### 3.1.8 线性读 ReadIndex
+* MsgReadIndex 消息，没有过 raft 协议
+1. 首先向 leader 获取最新的 committed index
+2. 等待，知道 applied index >= committed index
+3. 从状态机读数据
 
 ## 3.2 网络层 (raft-http)
 ### 3.2.1 etcd 集群之间网络传输的主要场景
@@ -1324,6 +1095,21 @@ type Event struct {
 }
 ```
 
+WatchResponse
+```go
+type WatchResponse struct {
+	// WatchID is the WatchID of the watcher this response sent to.
+	WatchID WatchID
+    // 触发事件的集合
+	Events []mvccpb.Event
+
+    // response 创建时的 revision
+	Revision int64
+	// CompactRevision is set when the watcher is cancelled due to compaction.
+	CompactRevision int64
+}
+```
+
 ### 3.7.2 连接复用
 * http2  多路复用、数据帧乱序发送
 * 一个 client/TCP 连接支持多 gRPC Stream， 一个 gRPC Stream 又支持多个 watcher
@@ -1363,55 +1149,31 @@ func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, as au
 ### 3.7.4 怎么快速找到 key 对应的 watcher 实例
 ![](img/18.png)
 
-watcher监听一个或一组key，如果有变更，watcher将变更内容通过chan发送出去。
-```go
-type watcher struct {
-    // 原始 key
-    key []byte
-    // 如果有值，则监听的是一个范围
-	end []byte
-
-    // 通道拥挤时，字段为true
-	victim bool
-
-	// compacted is set when the watcher is removed because of compaction
-	compacted bool
-
-	// restore is true when the watcher is being restored from leader snapshot
-	// which means that this watcher has just been moved from "synced" to "unsynced"
-	// watcher group, possibly with a future revision when it was first added
-	// to the synced watcher
-	// "unsynced" watcher revision must always be <= current revision,
-	// except when the watcher were to be moved from "synced" watcher group
-	restore bool
-
-    // minRev is the minimum revision update the watcher will accept
-    // 小于这个reverion的更新不会触发
-	minRev int64
-	id     WatchID
-
-    // 过滤器，触发的event事件需要经过过滤器封装后响应
-	fcs []FilterFunc
-	// a chan to send out the watch response.
-    // The chan might be shared with other watchers.
-	ch chan<- WatchResponse
-}
-```
-
 ```go
 type watcherGroup struct {
-    // 监听单个key的 watcher 实例
+    // 只监听单个key的 watcher 实例, type watcherSetByKey map[string]watcherSet
 	keyWatchers watcherSetByKey
     // ranges has the watchers that watch a range; it is sorted by interval
-    // 区间树，记录进行范围监听的watcher
+    // 区间树，记录进行范围监听的 watcher 实例
 	ranges adt.IntervalTree
     // watchers is the set of all watchers
 	watchers watcherSet
 }
 ```
+事件来临时：
+1. 检查是否有 watcher 监听了单 key （keyWatchers）
+2. 查找线段树，找到监听范围的所有 watchset
+3. 对找到的所有 wathchset 进行通知
+
 
 ## 3.8 服务端（etcd server）
+### 3.8.1 整体架构
 **todo**
+
+### 3.8.2 读写流程
+#### 读
+
+#### 写
 
 ## 3.8 客户端 （etcd client）
 **todo**
@@ -1420,11 +1182,10 @@ type watcherGroup struct {
 **todo**
 
 ## 3.10 实际问题
-### 一致性读(线性读)
-### 租约时间不准可能的原因
-### watch 历史事件可能丢吗
+todo 待大范围使用后补充
 
 ## 3.11 值得学习的设计
+* raft层：分层解耦设计
 * go http包: Transoport 维护的tcp连接池
 * boltdb: 非常简单的存储设计
 * watch 的设计： 考虑大量事件的缓冲
