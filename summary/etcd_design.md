@@ -1201,7 +1201,113 @@ func (bb *bucketBuffer) Range(key, endKey []byte, limit int64) (keys [][]byte, v
 todo
 
 ## 3.6 租约（leasor）
+
 ## 3.7 监听（watcher）
+快速获取数据变更通知，而不是使用消耗可能大的轮询模式。
+
+### 3.7.1 总体架构
+![](img/17.png)
+
+变更的消息是以Event的形式发送出去的，Event包括KeyValue，同时包括操作类型（Put、Delete等）
+```go
+type Event struct {
+    // 更新或者删除
+	Type Event_EventType `protobuf:"varint,1,opt,name=type,proto3,enum=mvccpb.Event_EventType" json:"type,omitempty"`
+    //发生事件之后的数据
+	Kv *KeyValue `protobuf:"bytes,2,opt,name=kv" json:"kv,omitempty"`
+    // 发生事件之前的数据
+	PrevKv *KeyValue `protobuf:"bytes,3,opt,name=prev_kv,json=prevKv" json:"prev_kv,omitempty"`
+}
+```
+
+
+
+### 3.7.2 连接复用
+* http2  多路复用、乱序发送
+* 一个 client/TCP 连接支持多 gRPC Stream， 一个 gRPC Stream 又支持多个 watcher
+![](img/19.png)
+
+
+### 3.7.3 事件堆积的情况
+![](../源码分析/img/29.png)
+
+* synced watcher, 表示此类 watcher 监听的数据都已经同步完毕，在等待新的变更。
+* unsynced watcher，表示此类 watcher 监听的数据还未同步完成，落后于当前最新数据变更，正在努力追赶。
+* victims(受损)，如果 buffer（默认1024）慢了，会从synced 摘掉，放进 victims
+    * 尝试将堆积的事件再次推送到 watcher 的接收 channel 中。
+	    * 若推送失败，则再次加入到 victim watcherBatch 数据结构中等待下次重试。
+		* 若推送成功，watcher 监听的最小版本号 (minRev) 小于等于 server 当前版本号 (currentRev)，加入到 unsynced watcherGroup, 否则重新进入 synced watcher
+
+```go
+func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, as auth.AuthStore, ig ConsistentIndexGetter, cfg StoreConfig) *watchableStore {
+	s := &watchableStore{
+		store:    NewStore(lg, b, le, ig, cfg),
+        victimc:  make(chan struct{}, 1),
+        // 创建两个 watchergroup
+		unsynced: newWatcherGroup(),
+		synced:   newWatcherGroup(),
+		stopc:    make(chan struct{}),
+	}
+	s.store.ReadView = &readView{s}
+	s.store.WriteView = &writeView{s}
+    s.wg.Add(2)
+    // 触发两个协程，处理usync和victims的
+	go s.syncWatchersLoop()
+	go s.syncVictimsLoop()
+	return s
+}
+```
+
+### 3.7.4 怎么快速找到 key 对应的 watcher 实例
+![](img/18.png)
+
+watcher监听一个或一组key，如果有变更，watcher将变更内容通过chan发送出去。
+```go
+type watcher struct {
+    // 原始 key
+    key []byte
+    // 如果有值，则监听的是一个范围
+	end []byte
+
+    // 通道拥挤时，字段为true
+	victim bool
+
+	// compacted is set when the watcher is removed because of compaction
+	compacted bool
+
+	// restore is true when the watcher is being restored from leader snapshot
+	// which means that this watcher has just been moved from "synced" to "unsynced"
+	// watcher group, possibly with a future revision when it was first added
+	// to the synced watcher
+	// "unsynced" watcher revision must always be <= current revision,
+	// except when the watcher were to be moved from "synced" watcher group
+	restore bool
+
+    // minRev is the minimum revision update the watcher will accept
+    // 小于这个reverion的更新不会触发
+	minRev int64
+	id     WatchID
+
+    // 过滤器，触发的event事件需要经过过滤器封装后响应
+	fcs []FilterFunc
+	// a chan to send out the watch response.
+    // The chan might be shared with other watchers.
+	ch chan<- WatchResponse
+}
+```
+
+```go
+type watcherGroup struct {
+    // 监听单个key的 watcher 实例
+	keyWatchers watcherSetByKey
+    // ranges has the watchers that watch a range; it is sorted by interval
+    // 区间树，记录进行范围监听的watcher
+	ranges adt.IntervalTree
+    // watchers is the set of all watchers
+	watchers watcherSet
+}
+```
+
 ## 3.8 服务端（etcd server）
 todo
 
@@ -1214,4 +1320,4 @@ todo
 ## 值得学习的设计
 * go http包: Transoport 维护的tcp连接池
 * boltdb: 非常简单的存储设计
-
+* watch 的设计： 考虑大量事件的缓冲
