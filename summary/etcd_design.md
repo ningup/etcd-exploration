@@ -968,6 +968,25 @@ func (bb *bucketBuffer) Range(key, endKey []byte, limit int64) (keys [][]byte, v
 
 所以大量度对写的影响
 
+### 3.4.8 事务 
+```go
+
+client.Txn(ctx).If(cmp1, cmp2, ...).Then(op1, op2, ...,).Else(op1, op2, …)
+```
+**if 支持的检查项**
+* key 的最近一次修改版本号 mod_revision
+* key 的创建版本号 create_revision
+* key 的修改次数 version
+* key 的 value 值
+
+**N read 1 write**
+* MVCC 写事务持有 boltdb 写锁，全局只有一个写事务
+
+**通过冲突检测解决事务不一致问题**
+1. 获取写的key的 mod_revision
+2. 真正进行写事务时判断 key 的 mod_revision 是否一致
+
+
 ## 3.5 持久层（boltdb）
 todo
 
@@ -1171,9 +1190,22 @@ type watcherGroup struct {
 **todo**
 
 ### 3.8.2 读写流程
-#### 读
+#### 读一个 key
+1. 客户端根据复杂均衡（默认 Round-robin）选择 endpoint，发起 KV Range RPC 读请求
+2. KVserver 从状态机读取
+   * 如果是串行读：直接从状态机读取
+   * 如果时线性读： readindex
+3.  进入到 MVCC，从 treeindex 索引找到 key 对应的 revision
+4. 拿着 revision 去读 buffer 找（二分），找不到的话去 boltdb db 查
 
-#### 写
+#### 写一个 key
+1. 客户端根据复杂均衡（默认 Round-robin）选择 endpoint，发起 KV Range RPC 写请求
+2. quata 检查，如果db空间不够不能写入
+3. 限速检查，太多没有应用的（领先已提交 5000），不能写入
+4. KVserver 交给 raft 进行日志复制，一半节点已提交返回给客户端成功 
+5. etcdserver 获取到需要应用的key 放到 FIFO里等待 APPLY 模块 应用
+6. apply 通过 mvcc 创建 revision，并像 boltdb 提交写事务, 更新 写 buffer
+7. boltdb 独自线程定期把为未提交的事务持久化磁盘
 
 ## 3.8 客户端 （etcd client）
 **todo**
