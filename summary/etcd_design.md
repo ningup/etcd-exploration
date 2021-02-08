@@ -322,7 +322,13 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 * 存储层：存储层包含预写日志 (WAL) 模块、快照 (Snapshot) 模块、boltdb 模块。
 
 # 3 模块原理拆解
+## 3.0 golang 简述
+### 3.0.1 go 协程
+### 3.2 go channel
+### 3.3 go net/http 
+
 ## 3.1 共识层（etcd-raft/node）
+raft 动画： http://thesecretlivesofdata.com//raft/
 ### 3.1.1 状态机复制
 ![](../基础知识/img/2.png)
 
