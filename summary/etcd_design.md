@@ -324,16 +324,45 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 * 存储层：存储层包含预写日志 (WAL) 模块、快照 (Snapshot) 模块、boltdb 模块。
 
 # 3 模块原理拆解
-## 3.0 golang 简述
-### 3.0.1 go 协程与通道
+## 3.0 golang 两大特性
+### 3.0.1 协程(goroutine)与通道(channel)
 goroutine： 平行宇宙中的每个世界
-go channel: 一个穿梭机，方便你在平行世界穿梭
+channel: 平行世界之间的穿梭机
 
 **协程**
-1. 协程调度：M:N 用户态协程与 OS 线程
-2. 上下嗯切换（压榨 CPU）：
+1. 协程调度：M:N 用户态协程与 OS 线程，系统线程数通常可以是 cpu 数量
+2. 上下文切换轻量, stack 初始大小 2k，java 1M？
 
-### 3.0.2 go net/http 
+**通道**
+![](img/22.png)
+```go
+type hchan struct {
+	qcount   uint
+	dataqsiz uint
+	// Channel 的缓冲区数据指针, 循环链表
+	buf      unsafe.Pointer
+	elemsize uint16
+	elemtype *_type
+	sendx    uint
+	recvx    uint
+	// 等待接收的 goroutine 队列，双向链表
+	recvq    waitq
+	// 等待发送的 goroutine 队列，双向链表
+	sendq    waitq
+	lock mutex
+}
+```
+![](img/23.png)
+发送：
+* 有缓冲区时，数据拷贝到缓冲区
+* 无缓冲区，有接受者时，直接拷贝到接受者的变量的地址
+* 无接受者或者缓冲区满了，阻塞
+
+接收：
+* 有缓冲区，从缓冲区拷贝到自己的地址上
+* 无缓冲区，有等待发送者，将数据拷贝到自己地址
+* 无发送者或者缓冲区空，阻塞
+ 
 
 ## 3.1 共识层（etcd-raft/node）
 raft 动画： http://thesecretlivesofdata.com//raft/
