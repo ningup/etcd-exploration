@@ -49,6 +49,8 @@ https://etcd.io/docs/v3.4.0/demo/
 +---------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
 ```
 
+**benchmars** https://github.com/etcd-io/etcd/blob/master/Documentation/op-guide/performance.md#benchmarks
+
 ## 1.5 版本控制 (MVCC)
 * 写操作都会创建新的版本
 * 读操作会从有限的多个版本中挑选一个最合适的（要么是最新版本，要么是指定版本)
@@ -323,9 +325,15 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 
 # 3 模块原理拆解
 ## 3.0 golang 简述
-### 3.0.1 go 协程
-### 3.2 go channel
-### 3.3 go net/http 
+### 3.0.1 go 协程与通道
+goroutine： 平行宇宙中的每个世界
+go channel: 一个穿梭机，方便你在平行世界穿梭
+
+**协程**
+1. 协程调度：M:N 用户态协程与 OS 线程
+2. 上下嗯切换（压榨 CPU）：
+
+### 3.0.2 go net/http 
 
 ## 3.1 共识层（etcd-raft/node）
 raft 动画： http://thesecretlivesofdata.com//raft/
