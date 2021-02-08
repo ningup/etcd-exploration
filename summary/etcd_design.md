@@ -325,9 +325,8 @@ func (e *Election) Resign(ctx context.Context) (err error) {
 
 # 3 模块原理拆解
 ## 3.0 golang 两大特性
-### 3.0.1 协程(goroutine)与通道(channel)
-goroutine： 平行宇宙中的每个世界
-channel: 平行世界之间的穿梭机
+协程 goroutine： 平行宇宙中的每个世界
+通道 channel: 平行世界之间的穿梭机
 
 **协程**
 1. 协程调度：M:N 用户态协程与 OS 线程，系统线程数通常可以是 cpu 数量
