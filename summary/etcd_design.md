@@ -1030,7 +1030,97 @@ client.Txn(ctx).If(cmp1, cmp2, ...).Then(op1, op2, ...,).Else(op1, op2, …)
 
 
 ## 3.5 持久层（boltdb）
-todo
+* 嵌入式 kv 数据库
+* b+ 树
+* bolt（归档）-> bblot（ etcd 进行维护）
+
+概念：
+db： mysql库
+bucket -> mysql表
+
+### 3.5.1 db 文件
+* member/snap/db
+* mmap
+![](img/25.png)
+
+page size: 4kB
+* 元数据页 (meta page) , 第0、1页，存储元数据, 一个有问题会使用另一个修复
+* B+ tree 索引节点页 (branch page)， 用于 b+ 树 索引，记录了 key 值
+* B+ tree 叶子节点页 (leaf page)，存储 key-value 以及 bucket 数据
+* 空闲页管理页 (freelist page)， 管理哪些页是空闲的
+* 空闲页 (free page)
+
+### 3.5.2 核心数据结构
+#### page 磁盘页
+```go
+const (
+    branchPageFlag = 0x01   // 分支节点
+    leafPageFlag = 0x02     // 叶子节点
+    metaPageFlag = 0x04     // meta 页
+    freelistPageFlag = 0x10 // freelist 页，存放无数据的空 page id
+)
+
+type pgid uint64
+
+type page struct {
+	// page id
+	id       pgid
+	// 页类型
+	flags    uint16
+	// 数据量技术
+	count    uint16
+	// 当前页面数据存放不下，需要向后再申请 overflow 个连续页面使用
+	overflow uint32
+	// page 数据起始位置，指向 page 的载体数据
+	ptr      uintptr
+}
+```
+
+#### meta page
+![](img/26.png)
+
+* root/bucket 记录的时 db 的 root bucket
+* key/lease/auth 等 bucket 都是 root bucket 的子 bucket
+
+#### bucket
+```go
+
+type bucket struct {
+   root     pgid   // page id of the bucket's root-level page
+   sequence uint64 // monotonically incrementing, used by NextSequence()
+}
+```
+#### leaf page
+![](img/27.png)
+
+#### branch page
+![](img/28.png)
+
+#### node
+page 在内存中的数据结构，page的反序列化结果
+
+#### freelist
+* 记录哪些 page 被使用，哪些 page 是空闲的
+* 删除数据，对应的 page 会被释放，页 ID 存储到 freelist 所指向的空闲页中
+* 写入数据时，可直接从空闲页中申请页面使用
+
+### 3.5.3 写事务过程
+1. open
+打开db文件、使用文件锁、防止被其他进程使用读写事务污染
+2. put
+    * 先找到 root bucket 的page
+	* 递归找到叶子节点key的位置，不存在则二分法插入到新位置
+![](img/29.png)
+
+此时只是更新到 node 内存中，没持久化
+
+### 3.5.4 持久化(事务提交)
+1. 插入 key 之后，进行平衡等操作是其满足 b+ 树特性
+2. 过程1可能释放申请新的 freelist，freepage 发生变化，持久化 freelist page
+3. fdatasync 系统调用把更新操作影响的page脏页持久化到磁盘
+4. meta page 的 txid、freelist 等字段会发生变化，最后持久化 metapage
+
+
 
 ## 3.6 租约（leasor）
 * 用于实现key定时删除功能
