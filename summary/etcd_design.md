@@ -1114,13 +1114,18 @@ page 在内存中的数据结构，page的反序列化结果
 
 此时只是更新到 node 内存中，没持久化
 
-### 3.5.4 持久化(事务提交)
-1. 插入 key 之后，进行平衡等操作是其满足 b+ 树特性
+### 3.5.4 为什么适合多读少写 ----- 持久化(事务提交)
+1. 插入 key 之后，先进行平衡等操作是其满足 b+ 树特性
 2. 过程1可能释放申请新的 freelist，freepage 发生变化，持久化 freelist page
 3. fdatasync 系统调用把更新操作影响的page脏页持久化到磁盘
 4. meta page 的 txid、freelist 等字段会发生变化，最后持久化 metapage
 
-
+通过 meta page 副本实现mvcc：  读写锁，N读 1写
+* 写
+1. 最后更新 metapage，如果前边失败了，元信息没写入不影响
+2. 更新的操作会从 freepage 申请新 page，写入新page，旧page可用于事务回滚， 新的page 写完才会更新旧 page
+* 读
+先复制 meta，以这个meta 进行索引，
 
 ## 3.6 租约（leasor）
 * 用于实现key定时删除功能
